@@ -26,6 +26,9 @@ from datetime import datetime
 from .config import MempalaceConfig
 from .searcher import search_memories
 from .palace_graph import traverse, find_tunnels, graph_stats
+from .closets import generate_closets, get_closet, list_closets
+from .layers import MemoryStack
+from .dialect import Dialect
 import chromadb
 
 from .knowledge_graph import KnowledgeGraph
@@ -436,6 +439,105 @@ def tool_diary_read(agent_name: str, last_n: int = 10):
         return {"error": str(e)}
 
 
+# ==================== WAKE-UP & RECALL ====================
+
+
+def tool_wake_up(wing: str = None):
+    """Generate the L0+L1 wake-up context for the AI."""
+    stack = MemoryStack(palace_path=_config.palace_path)
+    text = stack.wake_up(wing=wing)
+    tokens = len(text) // 4
+    return {"wake_up_text": text, "estimated_tokens": tokens}
+
+
+def tool_recall(wing: str = None, room: str = None, n_results: int = 10):
+    """On-demand L2 retrieval — load context for a specific wing/room."""
+    stack = MemoryStack(palace_path=_config.palace_path)
+    text = stack.recall(wing=wing, room=room, n_results=n_results)
+    return {"recall_text": text, "wing": wing, "room": room}
+
+
+# ==================== COMPRESSION ====================
+
+
+def tool_compress_text(text: str, wing: str = None, room: str = None):
+    """Compress any text to AAAK Dialect format on demand."""
+    dialect = Dialect()
+    metadata = {}
+    if wing:
+        metadata["wing"] = wing
+    if room:
+        metadata["room"] = room
+    compressed = dialect.compress(text, metadata=metadata)
+    stats = dialect.compression_stats(text, compressed)
+    return {
+        "compressed": compressed,
+        "original_tokens": stats["original_tokens"],
+        "compressed_tokens": stats["compressed_tokens"],
+        "ratio": round(stats["ratio"], 1),
+    }
+
+
+# ==================== CLOSETS ====================
+
+
+def tool_generate_closets(wing: str = None):
+    """Generate per-room AAAK closet summaries. Closets compress all drawers
+    in a room into one compact summary (~100-200 tokens per room)."""
+    closets = generate_closets(_config.palace_path, wing=wing)
+    return {
+        "closets_generated": len(closets),
+        "rooms": list(closets.keys()),
+    }
+
+
+def tool_get_closet(wing: str = None, room: str = None):
+    """Read a closet — the compressed summary of a room's contents."""
+    closets = get_closet(_config.palace_path, wing=wing, room=room)
+    if not closets:
+        return {"error": "No closets found. Run mempalace_generate_closets first."}
+    return {"closets": closets, "count": len(closets)}
+
+
+def tool_list_closets():
+    """List all available closets with their stats."""
+    closets = list_closets(_config.palace_path)
+    return {"closets": closets, "count": len(closets)}
+
+
+# ==================== CONTRADICTION CHECK ====================
+
+
+def tool_contradiction_check(subject: str, predicate: str, object: str):
+    """Check if a new fact contradicts existing knowledge in the graph.
+    Use this BEFORE adding facts to catch conflicts early."""
+    result = _kg.check_contradiction(subject, predicate, object)
+    return result
+
+
+def tool_kg_add_safe(
+    subject: str, predicate: str, object: str,
+    valid_from: str = None, source_closet: str = None,
+    auto_resolve: bool = True,
+):
+    """Add a fact to the knowledge graph WITH contradiction checking.
+    If auto_resolve=True (default), automatically invalidates conflicting
+    exclusive predicates (e.g. old 'uses' fact replaced by new one)."""
+    result = _kg.add_triple_with_contradiction_check(
+        subject, predicate, object,
+        valid_from=valid_from, source_closet=source_closet,
+        auto_resolve=auto_resolve,
+    )
+    return {
+        "success": True,
+        "triple_id": result["triple_id"],
+        "fact": f"{subject} → {predicate} → {object}",
+        "contradictions_found": len(result["contradictions"]),
+        "contradictions": result["contradictions"],
+        "auto_resolved": result["auto_resolved"],
+    }
+
+
 # ==================== MCP PROTOCOL ====================
 
 TOOLS = {
@@ -684,6 +786,103 @@ TOOLS = {
             "required": ["agent_name"],
         },
         "handler": tool_diary_read,
+    },
+    # ── Wake-up & Recall ──────────────────────────────────────────────
+    "mempalace_wake_up": {
+        "description": "Load L0 (identity) + L1 (essential story) context. This is the first thing to call at session start — gives the AI its memory in ~600-900 tokens. Optionally filter by wing for project-specific context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": "Optional wing filter for project-specific wake-up",
+                },
+            },
+        },
+        "handler": tool_wake_up,
+    },
+    "mempalace_recall": {
+        "description": "On-demand L2 retrieval — load context for a specific wing or room when a topic comes up in conversation. Returns ~200-500 tokens of relevant drawers.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Wing to retrieve from (optional)"},
+                "room": {"type": "string", "description": "Room to retrieve from (optional)"},
+                "n_results": {"type": "integer", "description": "Max drawers to return (default: 10)"},
+            },
+        },
+        "handler": tool_recall,
+    },
+    # ── Compression ──────────────────────────────────────────────────
+    "mempalace_compress": {
+        "description": "Compress any text to AAAK Dialect format on demand. Returns the compressed text with compression stats. Use this when you want to see how text would look in AAAK before storing it.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to compress"},
+                "wing": {"type": "string", "description": "Wing context for header (optional)"},
+                "room": {"type": "string", "description": "Room context for header (optional)"},
+            },
+            "required": ["text"],
+        },
+        "handler": tool_compress_text,
+    },
+    # ── Closets ──────────────────────────────────────────────────────
+    "mempalace_generate_closets": {
+        "description": "Generate per-room AAAK closet summaries. A closet compresses all drawers in one room into a single compact summary (~100-200 tokens). Run after mining to create room-level overviews.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Wing to generate closets for (optional — omit for all)"},
+            },
+        },
+        "handler": tool_generate_closets,
+    },
+    "mempalace_get_closet": {
+        "description": "Read a closet — the compressed AAAK summary of a room. Much faster than searching all drawers. Use closets for quick orientation, then drill into specific drawers with search if needed.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Wing filter (optional)"},
+                "room": {"type": "string", "description": "Room filter (optional)"},
+            },
+        },
+        "handler": tool_get_closet,
+    },
+    "mempalace_list_closets": {
+        "description": "List all available closets with stats (wing, room, drawer count, generation date).",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_list_closets,
+    },
+    # ── Contradiction Detection ──────────────────────────────────────
+    "mempalace_contradiction_check": {
+        "description": "Check if a new fact contradicts existing knowledge. Use BEFORE adding facts to catch conflicts. Detects: exclusive predicates (can't 'use' two things), contradictory pairs (loves vs hates), and previously-invalidated facts being re-added.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Entity doing/being something"},
+                "predicate": {"type": "string", "description": "Relationship type"},
+                "object": {"type": "string", "description": "Connected entity"},
+            },
+            "required": ["subject", "predicate", "object"],
+        },
+        "handler": tool_contradiction_check,
+    },
+    "mempalace_kg_add_safe": {
+        "description": "Add a fact to the knowledge graph WITH automatic contradiction detection and resolution. Safer than kg_add — checks for conflicts first and auto-resolves exclusive predicates (e.g. if project already 'uses' X, adding 'uses' Y will invalidate X).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity doing/being something"},
+                "predicate": {"type": "string", "description": "The relationship type"},
+                "object": {"type": "string", "description": "The entity being connected to"},
+                "valid_from": {"type": "string", "description": "When this became true (YYYY-MM-DD, optional)"},
+                "source_closet": {"type": "string", "description": "Closet ID where this fact appears (optional)"},
+                "auto_resolve": {"type": "boolean", "description": "Auto-invalidate conflicting exclusive predicates (default: true)"},
+            },
+            "required": ["subject", "predicate", "object"],
+        },
+        "handler": tool_kg_add_safe,
     },
 }
 

@@ -76,8 +76,9 @@ class Layer0:
 class Layer1:
     """
     ~500-800 tokens. Always loaded.
-    Auto-generated from the highest-weight / most-recent drawers in the palace.
-    Groups by room, picks the top N moments, compresses to a compact summary.
+    Auto-generated from closets (if available) or the highest-weight drawers.
+    Closets provide pre-compressed AAAK summaries per room — much more efficient.
+    Falls back to drawer-based generation if no closets exist.
     """
 
     MAX_DRAWERS = 15  # at most 15 moments in wake-up
@@ -89,7 +90,64 @@ class Layer1:
         self.wing = wing
 
     def generate(self) -> str:
-        """Pull top drawers from ChromaDB and format as compact L1 text."""
+        """Generate L1 from closets if available, else from top drawers."""
+        # Try closet-based generation first
+        closet_text = self._generate_from_closets()
+        if closet_text:
+            return closet_text
+
+        # Fallback: drawer-based generation
+        return self._generate_from_drawers()
+
+    def _generate_from_closets(self) -> str:
+        """Generate L1 from pre-compressed closet summaries."""
+        try:
+            client = chromadb.PersistentClient(path=self.palace_path)
+            closet_col = client.get_collection("mempalace_closets")
+        except Exception:
+            return ""
+
+        kwargs = {"include": ["documents", "metadatas"]}
+        if self.wing:
+            kwargs["where"] = {"wing": self.wing}
+
+        try:
+            results = closet_col.get(**kwargs)
+        except Exception:
+            return ""
+
+        docs = results.get("documents", [])
+        metas = results.get("metadatas", [])
+
+        if not docs:
+            return ""
+
+        lines = ["## L1 — ESSENTIAL STORY (from closets)"]
+        total_len = 0
+
+        for doc, meta in sorted(zip(docs, metas), key=lambda x: x[1].get("room", "")):
+            wing_name = meta.get("wing", "?")
+            room_name = meta.get("room", "?")
+            drawer_count = meta.get("drawer_count", 0)
+
+            header = f"\n[{wing_name}/{room_name}] ({drawer_count} memories)"
+            lines.append(header)
+            total_len += len(header)
+
+            # Include the closet content (already AAAK-compressed)
+            for closet_line in doc.split("\n"):
+                if closet_line.startswith("=CLOSET"):
+                    continue  # skip the closet header, we have our own
+                if total_len + len(closet_line) > self.MAX_CHARS:
+                    lines.append("  ... (more via mempalace_get_closet)")
+                    return "\n".join(lines)
+                lines.append(f"  {closet_line}")
+                total_len += len(closet_line)
+
+        return "\n".join(lines)
+
+    def _generate_from_drawers(self) -> str:
+        """Fallback: pull top drawers from ChromaDB and format as compact L1 text."""
         try:
             client = chromadb.PersistentClient(path=self.palace_path)
             col = client.get_collection("mempalace_drawers")

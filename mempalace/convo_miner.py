@@ -18,6 +18,7 @@ from collections import defaultdict
 import chromadb
 
 from .normalize import normalize
+from .miner import _post_mine_compress, _post_mine_extract_kg
 
 
 # File types that might contain conversations
@@ -378,11 +379,26 @@ def mine_convos(
         total_drawers += drawers_added
         print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers_added}")
 
+    # Post-mining: AAAK compression + KG extraction
+    compressed_count = 0
+    kg_triples = 0
+    if not dry_run and total_drawers > 0:
+        print(f"\n{'─' * 55}")
+        print("  Post-mining: compressing + extracting knowledge graph...")
+
+        entity_config = str(convo_path / "entities.json")
+        compressed_count = _post_mine_compress(palace_path, wing, entity_config)
+        kg_triples = _post_mine_extract_kg(palace_path, wing)
+
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {len(files) - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
+    if compressed_count > 0:
+        print(f"  AAAK compressed: {compressed_count} drawers")
+    if kg_triples > 0:
+        print(f"  KG triples extracted: {kg_triples}")
     if room_counts:
         print("\n  By room:")
         for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
