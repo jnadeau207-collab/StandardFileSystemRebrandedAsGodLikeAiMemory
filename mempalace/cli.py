@@ -147,6 +147,45 @@ def cmd_status(args):
     status(palace_path=palace_path)
 
 
+def cmd_closets(args):
+    """Generate or list per-room AAAK closet summaries."""
+    from .closets import generate_closets, list_closets
+
+    palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
+
+    if args.list:
+        closets = list_closets(palace_path)
+        if not closets:
+            print("\n  No closets generated yet. Run: mempalace closets [--wing NAME]")
+            return
+        print(f"\n{'=' * 55}")
+        print(f"  Closets — {len(closets)} rooms summarized")
+        print(f"{'=' * 55}\n")
+        for c in sorted(closets, key=lambda x: (x["wing"], x["room"])):
+            print(f"  {c['wing']:20} / {c['room']:20} ({c['drawer_count']} drawers)")
+        print()
+        return
+
+    # Generate closets
+    entity_config = args.config
+    if not entity_config:
+        for candidate in ["entities.json", os.path.join(palace_path, "entities.json")]:
+            if os.path.exists(candidate):
+                entity_config = candidate
+                break
+
+    print("\n  Generating closets" + (f" for wing '{args.wing}'" if args.wing else "") + "...")
+    closets = generate_closets(
+        palace_path,
+        wing=args.wing,
+        entity_config_path=entity_config,
+        dry_run=args.dry_run,
+    )
+    if not args.dry_run:
+        print(f"  Generated {len(closets)} closets.")
+    print()
+
+
 def cmd_compress(args):
     """Compress drawers in a wing using AAAK Dialect."""
     import chromadb
@@ -311,6 +350,15 @@ def main():
     p_search.add_argument("--room", default=None, help="Limit to one room")
     p_search.add_argument("--results", type=int, default=5, help="Number of results")
 
+    # closets
+    p_closets = sub.add_parser(
+        "closets", help="Generate per-room AAAK closet summaries"
+    )
+    p_closets.add_argument("--wing", default=None, help="Wing to generate closets for (default: all)")
+    p_closets.add_argument("--list", action="store_true", help="List existing closets instead of generating")
+    p_closets.add_argument("--dry-run", action="store_true", help="Preview without storing")
+    p_closets.add_argument("--config", default=None, help="Entity config JSON (e.g. entities.json)")
+
     # compress
     p_compress = sub.add_parser(
         "compress", help="Compress drawers using AAAK Dialect (~30x reduction)"
@@ -365,6 +413,7 @@ def main():
         "split": cmd_split,
         "search": cmd_search,
         "compress": cmd_compress,
+        "closets": cmd_closets,
         "wake-up": cmd_wakeup,
         "status": cmd_status,
     }

@@ -16,6 +16,9 @@ from collections import defaultdict
 
 import chromadb
 
+from .dialect import Dialect
+from .knowledge_graph import KnowledgeGraph
+
 READABLE_EXTENSIONS = {
     ".txt",
     ".md",
@@ -189,6 +192,12 @@ def get_collection(palace_path: str):
         return client.create_collection("mempalace_drawers")
 
 
+def get_compressed_collection(palace_path: str):
+    """Get or create the collection for AAAK-compressed drawers."""
+    client = chromadb.PersistentClient(path=palace_path)
+    return client.get_or_create_collection("mempalace_compressed")
+
+
 def file_already_mined(collection, source_file: str) -> bool:
     """Fast check: has this file been filed before?"""
     try:
@@ -312,6 +321,76 @@ def scan_project(project_dir: str) -> list:
 # =============================================================================
 
 
+def _post_mine_compress(palace_path, wing, entity_config_path=None):
+    """Post-mining: compress all new drawers using AAAK Dialect."""
+    try:
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+        comp_col = client.get_or_create_collection("mempalace_compressed")
+    except Exception:
+        return 0
+
+    # Load dialect
+    if entity_config_path and os.path.exists(entity_config_path):
+        dialect = Dialect.from_config(entity_config_path)
+    else:
+        dialect = Dialect()
+
+    # Get drawers in this wing
+    kwargs = {"include": ["documents", "metadatas"]}
+    if wing:
+        kwargs["where"] = {"wing": wing}
+    results = col.get(**kwargs)
+
+    # Get already-compressed IDs
+    try:
+        existing = comp_col.get(limit=50000)
+        existing_ids = set(existing["ids"])
+    except Exception:
+        existing_ids = set()
+
+    compressed_count = 0
+    for doc, meta, doc_id in zip(results["documents"], results["metadatas"], results["ids"]):
+        if doc_id in existing_ids:
+            continue
+        compressed = dialect.compress(doc, metadata=meta)
+        comp_meta = dict(meta)
+        stats = dialect.compression_stats(doc, compressed)
+        comp_meta["compression_ratio"] = round(stats["ratio"], 1)
+        comp_meta["original_tokens"] = stats["original_tokens"]
+        try:
+            comp_col.add(ids=[doc_id], documents=[compressed], metadatas=[comp_meta])
+            compressed_count += 1
+        except Exception:
+            pass  # skip duplicates
+
+    return compressed_count
+
+
+def _post_mine_extract_kg(palace_path, wing):
+    """Post-mining: extract knowledge graph triples from newly filed drawers."""
+    try:
+        client = chromadb.PersistentClient(path=palace_path)
+        col = client.get_collection("mempalace_drawers")
+    except Exception:
+        return 0
+
+    kg = KnowledgeGraph()
+
+    kwargs = {"include": ["documents", "metadatas"]}
+    if wing:
+        kwargs["where"] = {"wing": wing}
+    results = col.get(**kwargs)
+
+    total_triples = 0
+    for doc, meta in zip(results["documents"], results["metadatas"]):
+        source = meta.get("source_file", "")
+        triples = kg.extract_triples_from_text(doc, source_file=source)
+        total_triples += len(triples)
+
+    return total_triples
+
+
 def mine(
     project_dir: str,
     palace_path: str,
@@ -371,11 +450,26 @@ def mine(
             if not dry_run:
                 print(f"  ✓ [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
 
+    # Post-mining: AAAK compression + KG extraction
+    compressed_count = 0
+    kg_triples = 0
+    if not dry_run and total_drawers > 0:
+        print(f"\n{'─' * 55}")
+        print("  Post-mining: compressing + extracting knowledge graph...")
+
+        entity_config = str(project_path / "entities.json")
+        compressed_count = _post_mine_compress(palace_path, wing, entity_config)
+        kg_triples = _post_mine_extract_kg(palace_path, wing)
+
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {len(files) - files_skipped}")
     print(f"  Files skipped (already filed): {files_skipped}")
     print(f"  Drawers filed: {total_drawers}")
+    if compressed_count > 0:
+        print(f"  AAAK compressed: {compressed_count} drawers")
+    if kg_triples > 0:
+        print(f"  KG triples extracted: {kg_triples}")
     print("\n  By room:")
     for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
         print(f"    {room:20} {count} files")
