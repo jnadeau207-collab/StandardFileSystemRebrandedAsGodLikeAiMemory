@@ -317,8 +317,9 @@ class Dialect:
         dialect.generate_layer1("zettels/", output="LAYER1.aaak")
     """
 
-    def __init__(self, entities: Dict[str, str] = None, skip_names: List[str] = None,
-                 lang: str = None):
+    def __init__(
+        self, entities: Dict[str, str] = None, skip_names: List[str] = None, lang: str = None
+    ):
         """
         Args:
             entities: Mapping of full names -> short codes.
@@ -337,6 +338,7 @@ class Dialect:
 
         # Load language-specific AAAK instruction and regex patterns
         from mempalace.i18n import load_lang, t, current_lang, get_regex
+
         if lang:
             load_lang(lang)
         self.lang = lang or current_lang()

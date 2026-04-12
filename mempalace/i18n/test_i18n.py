@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """Quick smoke test for i18n dictionaries + Dialect integration."""
 
-import json
 import sys
 from pathlib import Path
 
 # Add parent to path so we can import mempalace
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from mempalace.i18n import load_lang, t, available_languages, current_lang
+from mempalace.i18n import load_lang, t, available_languages
 from mempalace.dialect import Dialect
 
 
