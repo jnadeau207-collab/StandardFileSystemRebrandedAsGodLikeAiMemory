@@ -13,6 +13,7 @@ from mempalace.normalize import (
     _try_normalize_json,
     _try_slack_json,
     normalize,
+    strip_noise,
 )
 
 
@@ -1048,3 +1049,148 @@ def test_normalize_rejects_large_file():
             assert False, "Should have raised IOError"
         except IOError as e:
             assert "too large" in str(e).lower()
+
+
+# ── strip_noise() — verbatim-safety boundary tests ─────────────────────
+#
+# The "Verbatim always" design principle requires that we never delete
+# user-authored text. These tests pin down the boundary between system
+# noise (which we strip) and user prose that happens to mention the same
+# strings (which must survive untouched).
+
+
+class TestStripNoisePreservesUserContent:
+    """User prose that mentions noise strings inline must be preserved."""
+
+    def test_user_discusses_stop_hook_in_prose(self):
+        # Regression: original regex with IGNORECASE + `.*\n?` ate the second
+        # sentence from real user commentary.
+        text = (
+            "> User:\n"
+            "> Our CI has a stop hook that rejects merges after 5pm. "
+            "Ran 2 stop hooks last week.\n"
+            "> Assistant:\n"
+            "> Got it."
+        )
+        assert strip_noise(text) == text.strip()
+
+    def test_user_mentions_system_reminder_inline(self):
+        # Inline <system-reminder> tags inside user prose (e.g. documenting
+        # Claude Code behavior) must not be stripped.
+        text = (
+            "> User:\n"
+            "> Here is what Claude Code emits: "
+            "<system-reminder>Auto-save reminder...</system-reminder>"
+            " — I want to ignore it."
+        )
+        assert strip_noise(text) == text.strip()
+
+    def test_ctrl_o_hint_in_prose_preserved(self):
+        # Regression: original `.*\(ctrl\+o to expand\).*\n?` nuked the whole
+        # line whenever a user documented the TUI shortcut.
+        text = (
+            "> User:\n"
+            "> In the TUI you hit (ctrl+o to expand) to see more. "
+            "That is the shortcut I want to document."
+        )
+        assert strip_noise(text) == text.strip()
+
+    def test_current_time_inline_in_prose(self):
+        text = "> User:\n> At CURRENT TIME: the meeting starts, not before."
+        assert strip_noise(text) == text.strip()
+
+    def test_plus_n_lines_marker_inline(self):
+        text = "> User:\n> The log showed … +50 lines of stack trace, useful."
+        assert strip_noise(text) == text.strip()
+
+    def test_dangling_open_tag_does_not_span_messages(self):
+        # THE span-eating bug: a stray unclosed <system-reminder> in one
+        # message must NOT merge with a closing tag in another message and
+        # silently delete everything in between.
+        text = (
+            "> User 1: normal content <system-reminder>A\n"
+            "> Assistant: reply\n"
+            "> User 2: more content</system-reminder> tail"
+        )
+        out = strip_noise(text)
+        assert "Assistant: reply" in out
+        assert "User 2: more content" in out
+        assert "User 1: normal content" in out
+
+
+class TestStripNoiseRemovesSystemChrome:
+    """System-injected noise with standalone/line-anchored shape must be stripped."""
+
+    def test_strips_line_anchored_system_reminder_block(self):
+        text = (
+            "> User:\n"
+            "<system-reminder>\n"
+            "Auto-save reminder...\n"
+            "</system-reminder>\n"
+            "> Real message."
+        )
+        out = strip_noise(text)
+        assert "system-reminder" not in out
+        assert "Auto-save reminder" not in out
+        assert "Real message." in out
+
+    def test_strips_system_reminder_with_blockquote_prefix(self):
+        # _messages_to_transcript prefixes lines with "> ", so the line
+        # anchor must also accept that shape.
+        text = "> User:\n" "> <system-reminder>Injected noise</system-reminder>\n" "> Real message."
+        out = strip_noise(text)
+        assert "Injected noise" not in out
+        assert "Real message." in out
+
+    def test_strips_standalone_ran_hook_line(self):
+        text = "Ran 2 Stop hook\n> User: real content"
+        out = strip_noise(text)
+        assert "Ran 2 Stop hook" not in out
+        assert "real content" in out
+
+    def test_strips_known_hook_names(self):
+        for hook in ("Stop", "PreCompact", "PreToolUse", "PostToolUse", "UserPromptSubmit"):
+            text = f"Ran 1 {hook} hook\n> User: content"
+            assert hook not in strip_noise(text)
+
+    def test_strips_current_time_standalone(self):
+        text = "CURRENT TIME: 2026-04-13 10:00 UTC\n> User: Hello"
+        out = strip_noise(text)
+        assert "CURRENT TIME" not in out
+        assert "Hello" in out
+
+    def test_strips_collapsed_lines_marker(self):
+        text = "… +42 lines\n> User: Hello"
+        out = strip_noise(text)
+        assert "+42 lines" not in out
+        assert "Hello" in out
+
+    def test_strips_token_count_ctrl_o_chrome(self):
+        # Claude Code's actual collapsed-output chrome: "[N tokens] (ctrl+o to expand)"
+        text = "> Assistant: some output [5 tokens] (ctrl+o to expand)\n> User: ok"
+        out = strip_noise(text)
+        assert "(ctrl+o to expand)" not in out
+        assert "[5 tokens]" not in out
+        assert "some output" in out
+
+    def test_strips_each_known_noise_tag(self):
+        for tag in (
+            "system-reminder",
+            "command-message",
+            "command-name",
+            "task-notification",
+            "user-prompt-submit-hook",
+            "hook_output",
+        ):
+            text = f"> User:\n<{tag}>junk</{tag}>\n> Real."
+            out = strip_noise(text)
+            assert tag not in out, f"{tag} leaked into output"
+            assert "Real." in out
+
+    def test_collapses_excessive_blank_lines(self):
+        text = "line one\n\n\n\n\n\nline two"
+        out = strip_noise(text)
+        assert "line one" in out
+        assert "line two" in out
+        # Should collapse to no more than 3 newlines
+        assert "\n\n\n\n" not in out

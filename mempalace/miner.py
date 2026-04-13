@@ -16,8 +16,15 @@ from datetime import datetime
 from collections import defaultdict
 
 from .palace import (
-    SKIP_DIRS, get_collection, get_closets_collection,
-    file_already_mined, mine_lock, build_closet_lines, upsert_closet_lines,
+    NORMALIZE_VERSION,
+    SKIP_DIRS,
+    build_closet_lines,
+    file_already_mined,
+    get_closets_collection,
+    get_collection,
+    mine_lock,
+    purge_file_closets,
+    upsert_closet_lines,
 )
 
 READABLE_EXTENSIONS = {
@@ -371,41 +378,86 @@ def chunk_text(content: str, source_file: str) -> list:
 # =============================================================================
 
 
+_ENTITY_REGISTRY_PATH = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
+_ENTITY_REGISTRY_CACHE: dict = {"mtime": None, "names": frozenset()}
+_ENTITY_EXTRACT_WINDOW = 5000  # chars of content scanned for capitalized words
+_ENTITY_METADATA_LIMIT = 25  # max entities packed into the metadata field
+
+
+def _load_known_entities() -> frozenset:
+    """Load (and cache) the user's known-entity registry by mtime.
+
+    Reads ``~/.mempalace/known_entities.json``. The registry is shaped as
+    ``{"category": ["Name1", "Name2", ...], ...}``. Cached across calls
+    in the same process; invalidated when the file's mtime changes.
+    """
+    try:
+        mtime = os.path.getmtime(_ENTITY_REGISTRY_PATH)
+    except OSError:
+        if _ENTITY_REGISTRY_CACHE["mtime"] is not None:
+            _ENTITY_REGISTRY_CACHE["mtime"] = None
+            _ENTITY_REGISTRY_CACHE["names"] = frozenset()
+        return _ENTITY_REGISTRY_CACHE["names"]
+
+    if _ENTITY_REGISTRY_CACHE["mtime"] == mtime:
+        return _ENTITY_REGISTRY_CACHE["names"]
+
+    names: set = set()
+    try:
+        import json
+
+        with open(_ENTITY_REGISTRY_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for cat in data.values():
+            if isinstance(cat, list):
+                names.update(str(n) for n in cat if n)
+    except Exception:
+        names = set()
+
+    _ENTITY_REGISTRY_CACHE["mtime"] = mtime
+    _ENTITY_REGISTRY_CACHE["names"] = frozenset(names)
+    return _ENTITY_REGISTRY_CACHE["names"]
+
+
 def _extract_entities_for_metadata(content: str) -> str:
     """Extract entity names from content for metadata tagging.
 
-    Returns semicolon-separated string of entity names found in the text,
-    suitable for ChromaDB metadata filtering.
+    Combines the user's known-entity registry (cached across calls) with
+    capitalized words appearing ≥2 times in the first ``_ENTITY_EXTRACT_WINDOW``
+    chars. Filters out the closet stoplist (``When``, ``After``, ``The``, …)
+    so sentence-starters don't masquerade as proper nouns.
+
+    Returns semicolon-separated string suitable for ChromaDB metadata
+    filtering. The list is truncated to ``_ENTITY_METADATA_LIMIT`` entries
+    *before* joining so a name is never cut in half.
     """
     import re
-    # Load known entities from registry if available
-    known_names = set()
-    registry_path = os.path.join(os.path.expanduser("~"), ".mempalace", "known_entities.json")
-    if os.path.exists(registry_path):
-        try:
-            import json
-            kd = json.loads(open(registry_path).read())
-            for cat in kd.values():
-                if isinstance(cat, list):
-                    known_names.update(cat)
-        except Exception:
-            pass
 
-    matched = set()
-    # Match known entities
-    for name in known_names:
-        if re.search(r'(?<!\w)' + re.escape(name) + r'(?!\w)', content):
+    from .palace import _ENTITY_STOPLIST
+
+    matched: set = set()
+
+    known = _load_known_entities()
+    for name in known:
+        if re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", content):
             matched.add(name)
-    # Also catch capitalized words appearing 2+ times (likely proper nouns)
-    words = re.findall(r"\b[A-Z][a-z]{2,}\b", content[:5000])
-    freq = {}
+
+    window = content[:_ENTITY_EXTRACT_WINDOW]
+    words = re.findall(r"\b[A-Z][a-z]{2,}\b", window)
+    freq: dict = {}
     for w in words:
+        if w in _ENTITY_STOPLIST:
+            continue
         freq[w] = freq.get(w, 0) + 1
     for w, c in freq.items():
         if c >= 2 and len(w) > 2:
             matched.add(w)
 
-    return ";".join(sorted(matched))[:500] if matched else ""
+    if not matched:
+        return ""
+    # Truncate the *list*, not the joined string — never split a name.
+    capped = sorted(matched)[:_ENTITY_METADATA_LIMIT]
+    return ";".join(capped)
 
 
 def add_drawer(
@@ -421,6 +473,7 @@ def add_drawer(
             "chunk_index": chunk_index,
             "added_by": agent,
             "filed_at": datetime.now().isoformat(),
+            "normalize_version": NORMALIZE_VERSION,
         }
         # Store file mtime so we can detect modifications later.
         try:
@@ -511,15 +564,18 @@ def process_file(
             if added:
                 drawers_added += 1
 
-        # Build closet — the searchable index pointing to these drawers
-        # Each topic line is atomic — never split across closets
+        # Build closet — the searchable index pointing to these drawers.
+        # Purge first: a re-mine (mtime change or normalize_version bump) must
+        # fully replace the prior closets, not append to them.
         if closets_col and drawers_added > 0:
             drawer_ids = [
                 f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(c['chunk_index'])).encode()).hexdigest()[:24]}"
                 for c in chunks
             ]
             closet_lines = build_closet_lines(source_file, drawer_ids, content, wing, room)
-            closet_id_base = f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+            closet_id_base = (
+                f"closet_{wing}_{room}_{hashlib.sha256(source_file.encode()).hexdigest()[:24]}"
+            )
             entities = _extract_entities_for_metadata(content)
             closet_meta = {
                 "wing": wing,
@@ -527,9 +583,11 @@ def process_file(
                 "source_file": source_file,
                 "drawer_count": drawers_added,
                 "filed_at": datetime.now().isoformat(),
+                "normalize_version": NORMALIZE_VERSION,
             }
             if entities:
                 closet_meta["entities"] = entities
+            purge_file_closets(closets_col, source_file)
             upsert_closet_lines(closets_col, closet_id_base, closet_lines, closet_meta)
 
     return drawers_added, room

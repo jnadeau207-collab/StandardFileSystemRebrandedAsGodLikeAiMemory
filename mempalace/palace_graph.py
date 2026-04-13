@@ -18,11 +18,12 @@ No external graph DB needed — built from ChromaDB metadata.
 import hashlib
 import json
 import os
-from collections import defaultdict, Counter
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import datetime, timezone
 
 from .config import MempalaceConfig
 from .palace import get_collection as _get_palace_collection
+from .palace import mine_lock
 
 
 def _get_collection(config=None):
@@ -249,20 +250,66 @@ _TUNNEL_FILE = os.path.join(os.path.expanduser("~"), ".mempalace", "tunnels.json
 
 
 def _load_tunnels():
-    """Load explicit tunnels from disk."""
-    if os.path.exists(_TUNNEL_FILE):
-        try:
-            return json.loads(open(_TUNNEL_FILE).read())
-        except Exception:
-            pass
-    return []
+    """Load explicit tunnels from disk.
+
+    Returns an empty list if the file is missing or corrupt (e.g. truncated
+    by a crash mid-write on a system that lacks atomic-rename semantics).
+    """
+    if not os.path.exists(_TUNNEL_FILE):
+        return []
+    try:
+        with open(_TUNNEL_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return []
+    return data if isinstance(data, list) else []
 
 
 def _save_tunnels(tunnels):
-    """Save explicit tunnels to disk."""
+    """Persist explicit tunnels atomically.
+
+    Writes to ``tunnels.json.tmp`` then ``os.replace``s it into place, so
+    a crash mid-write can never leave a partial/empty tunnels.json that
+    silently wipes every tunnel on next read.
+    """
     os.makedirs(os.path.dirname(_TUNNEL_FILE), exist_ok=True)
-    with open(_TUNNEL_FILE, "w") as f:
+    tmp_path = _TUNNEL_FILE + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(tunnels, f, indent=2)
+        f.flush()
+        try:
+            os.fsync(f.fileno())
+        except OSError:
+            # Not all filesystems (or Windows file handles) support fsync — tolerate.
+            pass
+    os.replace(tmp_path, _TUNNEL_FILE)
+
+
+def _endpoint_key(wing: str, room: str) -> str:
+    return f"{wing}/{room}"
+
+
+def _canonical_tunnel_id(
+    source_wing: str, source_room: str, target_wing: str, target_room: str
+) -> str:
+    """Compute a symmetric tunnel ID.
+
+    Tunnels are conceptually undirected — "auth relates to users" is the
+    same connection as "users relates to auth". Sort the two endpoints
+    before hashing so ``create_tunnel(A, B)`` and ``create_tunnel(B, A)``
+    resolve to the same ID and dedup into one record.
+    """
+    src = _endpoint_key(source_wing, source_room)
+    tgt = _endpoint_key(target_wing, target_room)
+    a, b = sorted((src, tgt))
+    return hashlib.sha256(f"{a}↔{b}".encode()).hexdigest()[:16]
+
+
+def _require_name(value: str, field: str) -> str:
+    """Reject empty / non-string endpoint identifiers."""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty string")
+    return value.strip()
 
 
 def create_tunnel(
@@ -274,72 +321,88 @@ def create_tunnel(
     source_drawer_id: str = None,
     target_drawer_id: str = None,
 ):
-    """Create an explicit tunnel between two locations in the palace.
+    """Create an explicit (symmetric) tunnel between two locations in the palace.
 
-    Use when an agent notices a connection between two projects/wings
-    that wouldn't be found by passive room-name matching.
+    Tunnels are undirected: ``create_tunnel(A, B)`` and ``create_tunnel(B, A)``
+    resolve to the same canonical ID. A second call with the same endpoints
+    updates the stored label (and drawer IDs, if provided) rather than
+    creating a duplicate.
+
+    The ``source`` / ``target`` fields on the returned dict preserve the
+    argument order the caller used, so callers can display it directionally
+    if they like. The ID and dedup are symmetric.
 
     Args:
-        source_wing: Wing of the source (e.g., "project_api")
-        source_room: Room in the source wing
-        target_wing: Wing of the target (e.g., "project_database")
-        target_room: Room in the target wing
-        label: Description of the connection
-        source_drawer_id: Optional specific drawer ID
-        target_drawer_id: Optional specific drawer ID
+        source_wing: Wing of the source (e.g., "project_api").
+        source_room: Room in the source wing.
+        target_wing: Wing of the target (e.g., "project_database").
+        target_room: Room in the target wing.
+        label: Description of the connection.
+        source_drawer_id: Optional specific drawer ID.
+        target_drawer_id: Optional specific drawer ID.
 
     Returns:
-        The created tunnel dict.
+        The stored tunnel dict.
+
+    Raises:
+        ValueError: if any wing or room is empty or non-string.
     """
-    tunnel_id = hashlib.sha256(
-        f"{source_wing}/{source_room}↔{target_wing}/{target_room}".encode()
-    ).hexdigest()[:16]
+    source_wing = _require_name(source_wing, "source_wing")
+    source_room = _require_name(source_room, "source_room")
+    target_wing = _require_name(target_wing, "target_wing")
+    target_room = _require_name(target_room, "target_room")
+
+    tunnel_id = _canonical_tunnel_id(source_wing, source_room, target_wing, target_room)
 
     tunnel = {
         "id": tunnel_id,
         "source": {"wing": source_wing, "room": source_room},
         "target": {"wing": target_wing, "room": target_room},
         "label": label,
-        "created_at": datetime.now().isoformat(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if source_drawer_id:
         tunnel["source"]["drawer_id"] = source_drawer_id
     if target_drawer_id:
         tunnel["target"]["drawer_id"] = target_drawer_id
 
-    tunnels = _load_tunnels()
-
-    # Dedup — don't create if same endpoints already linked
-    for existing in tunnels:
-        if existing.get("id") == tunnel_id:
-            existing.update(tunnel)  # update label/drawers
-            _save_tunnels(tunnels)
-            return existing
-
-    tunnels.append(tunnel)
-    _save_tunnels(tunnels)
+    # Serialize the load → mutate → save cycle. Without this, two concurrent
+    # create_tunnel calls can both read the same snapshot and the later
+    # writer silently drops the earlier writer's tunnel.
+    with mine_lock(_TUNNEL_FILE):
+        tunnels = _load_tunnels()
+        for existing in tunnels:
+            if existing.get("id") == tunnel_id:
+                # Preserve original creation timestamp on label updates.
+                tunnel["created_at"] = existing.get("created_at", tunnel["created_at"])
+                tunnel["updated_at"] = datetime.now(timezone.utc).isoformat()
+                existing.clear()
+                existing.update(tunnel)
+                _save_tunnels(tunnels)
+                return existing
+        tunnels.append(tunnel)
+        _save_tunnels(tunnels)
     return tunnel
 
 
 def list_tunnels(wing: str = None):
     """List all explicit tunnels, optionally filtered by wing.
 
-    Returns tunnels where the wing appears as either source or target.
+    Returns tunnels where ``wing`` appears as either source or target
+    (tunnels are symmetric, so either endpoint is a valid filter match).
     """
     tunnels = _load_tunnels()
     if wing:
-        tunnels = [
-            t for t in tunnels
-            if t["source"]["wing"] == wing or t["target"]["wing"] == wing
-        ]
+        tunnels = [t for t in tunnels if t["source"]["wing"] == wing or t["target"]["wing"] == wing]
     return tunnels
 
 
 def delete_tunnel(tunnel_id: str):
-    """Delete an explicit tunnel by ID."""
-    tunnels = _load_tunnels()
-    tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
-    _save_tunnels(tunnels)
+    """Delete an explicit tunnel by ID. Returns ``{"deleted": <id>}``."""
+    with mine_lock(_TUNNEL_FILE):
+        tunnels = _load_tunnels()
+        tunnels = [t for t in tunnels if t.get("id") != tunnel_id]
+        _save_tunnels(tunnels)
     return {"deleted": tunnel_id}
 
 
@@ -357,23 +420,27 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
         tgt = t["target"]
 
         if src["wing"] == wing and src["room"] == room:
-            connections.append({
-                "direction": "outgoing",
-                "connected_wing": tgt["wing"],
-                "connected_room": tgt["room"],
-                "label": t.get("label", ""),
-                "drawer_id": tgt.get("drawer_id"),
-                "tunnel_id": t["id"],
-            })
+            connections.append(
+                {
+                    "direction": "outgoing",
+                    "connected_wing": tgt["wing"],
+                    "connected_room": tgt["room"],
+                    "label": t.get("label", ""),
+                    "drawer_id": tgt.get("drawer_id"),
+                    "tunnel_id": t["id"],
+                }
+            )
         elif tgt["wing"] == wing and tgt["room"] == room:
-            connections.append({
-                "direction": "incoming",
-                "connected_wing": src["wing"],
-                "connected_room": src["room"],
-                "label": t.get("label", ""),
-                "drawer_id": src.get("drawer_id"),
-                "tunnel_id": t["id"],
-            })
+            connections.append(
+                {
+                    "direction": "incoming",
+                    "connected_wing": src["wing"],
+                    "connected_room": src["room"],
+                    "label": t.get("label", ""),
+                    "drawer_id": src.get("drawer_id"),
+                    "tunnel_id": t["id"],
+                }
+            )
 
     # If we have a collection, fetch drawer content for connected items
     if col and connections:
