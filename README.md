@@ -448,51 +448,29 @@ Letta charges $20–200/mo for agent-managed memory. MemPalace does it with a wi
 claude mcp add mempalace -- python -m mempalace.mcp_server
 ```
 
-### 19 Tools
+### MCP tool surface (35 tools)
 
-**Palace (read)**
+Current MCP surface includes read/write tools, canonical structure tools, graph traversal, knowledge graph tools, diary, and recall/compression helpers.
 
-| Tool | What |
-|------|------|
-| `mempalace_status` | Palace overview + AAAK spec + memory protocol |
-| `mempalace_list_wings` | Wings with counts |
-| `mempalace_list_rooms` | Rooms within a wing |
-| `mempalace_get_taxonomy` | Full wing → room → count tree |
-| `mempalace_search` | Semantic search with wing/room filters |
-| `mempalace_check_duplicate` | Check before filing |
-| `mempalace_get_aaak_spec` | AAAK dialect reference |
+**Core palace read/write (12)**
 
-**Palace (write)**
+`mempalace_status`, `mempalace_list_wings`, `mempalace_list_rooms`, `mempalace_get_taxonomy`, `mempalace_search`, `mempalace_check_duplicate`, `mempalace_get_aaak_spec`, `mempalace_add_drawer`, `mempalace_delete_drawer`, `mempalace_generate_closets`, `mempalace_get_closet`, `mempalace_list_closets`.
 
-| Tool | What |
-|------|------|
-| `mempalace_add_drawer` | File verbatim content |
-| `mempalace_delete_drawer` | Remove by ID |
+**Canonical structure + lineage (8)**
 
-**Knowledge Graph**
+`mempalace_structure_trace_node`, `mempalace_structure_trace_drawer`, `mempalace_structure_validate`, `mempalace_structure_resolve`, `mempalace_structure_list_children`, `mempalace_structure_create_gateway_anchor`, `mempalace_structure_create_subdomain`, `mempalace_structure_create_nested_subdomain`.
 
-| Tool | What |
-|------|------|
-| `mempalace_kg_query` | Entity relationships with time filtering |
-| `mempalace_kg_add` | Add facts |
-| `mempalace_kg_invalidate` | Mark facts as ended |
-| `mempalace_kg_timeline` | Chronological entity story |
-| `mempalace_kg_stats` | Graph overview |
+**Graph traversal (3)**
 
-**Navigation**
+`mempalace_traverse`, `mempalace_find_tunnels`, `mempalace_graph_stats`.
 
-| Tool | What |
-|------|------|
-| `mempalace_traverse` | Walk the graph from a room across wings |
-| `mempalace_find_tunnels` | Find rooms bridging two wings |
-| `mempalace_graph_stats` | Graph connectivity overview |
+**Knowledge graph (7)**
 
-**Agent Diary**
+`mempalace_kg_query`, `mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_timeline`, `mempalace_kg_stats`, `mempalace_contradiction_check`, `mempalace_kg_add_safe`.
 
-| Tool | What |
-|------|------|
-| `mempalace_diary_write` | Write AAAK diary entry |
-| `mempalace_diary_read` | Read recent diary entries |
+**Diary + recall/compression (5)**
+
+`mempalace_diary_write`, `mempalace_diary_read`, `mempalace_wake_up`, `mempalace_recall`, `mempalace_compress`.
 
 The AI learns AAAK and the memory protocol automatically from the `mempalace_status` response. No manual configuration.
 
@@ -618,14 +596,14 @@ Plain text. Becomes Layer 0 — loaded every session.
 | `cli.py` | CLI entry point |
 | `config.py` | Configuration loading and defaults |
 | `normalize.py` | Converts 5 chat formats to standard transcript |
-| `mcp_server.py` | MCP server — 19 tools, AAAK auto-teach, memory protocol |
+| `mcp_server.py` | MCP server — 35 tools across read/write/structure/graph/KG/diary/recall |
 | `miner.py` | Project file ingest |
 | `convo_miner.py` | Conversation ingest — chunks by exchange pair |
-| `searcher.py` | Semantic search via ChromaDB |
-| `layers.py` | 4-layer memory stack |
+| `searcher.py` | Structure-aware semantic search via ChromaDB (legacy + canonical metadata) |
+| `layers.py` | 4-layer memory stack with structure-aware context fields |
 | `dialect.py` | AAAK compression — 30x lossless |
 | `knowledge_graph.py` | Temporal entity-relationship graph (SQLite) |
-| `palace_graph.py` | Room-based navigation graph |
+| `palace_graph.py` | Structure-aware + legacy graph traversal (containment/gateway/tunnel) |
 | `onboarding.py` | Guided setup — generates AAAK bootstrap + wing config |
 | `entity_registry.py` | Entity code registry |
 | `entity_detector.py` | Auto-detect people and projects from content |
@@ -642,13 +620,13 @@ mempalace/
 ├── README.md                  ← you are here
 ├── mempalace/                 ← core package (README)
 │   ├── cli.py                 ← CLI entry point
-│   ├── mcp_server.py          ← MCP server (19 tools)
+│   ├── mcp_server.py          ← MCP server (35 tools)
 │   ├── knowledge_graph.py     ← temporal entity graph
-│   ├── palace_graph.py        ← room navigation graph
+│   ├── palace_graph.py        ← structure-aware + legacy graph traversal
 │   ├── dialect.py             ← AAAK compression
 │   ├── miner.py               ← project file ingest
 │   ├── convo_miner.py         ← conversation ingest
-│   ├── searcher.py            ← semantic search
+│   ├── searcher.py            ← structure-aware semantic search
 │   ├── onboarding.py          ← guided setup
 │   └── ...                    ← see mempalace/README.md
 ├── benchmarks/                ← reproducible benchmark runners

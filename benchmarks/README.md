@@ -5,8 +5,8 @@ Run the exact same benchmarks we report. Clone, install, run.
 ## Setup
 
 ```bash
-git clone -b ben/benchmarking https://github.com/aya-thekeeper/mempal.git
-cd mempal
+# Use this repository checkout
+cd /path/to/StandardFileSystemRebrandedAsGodLikeAiMemory
 pip install chromadb pyyaml
 ```
 
@@ -107,7 +107,7 @@ Time:            ~2 minutes
 
 ## Results Files
 
-Raw results are in `benchmarks/results_*.jsonl` and `benchmarks/results_*.json`. Each file contains every question, every retrieved document, and every score — fully auditable.
+Running the benchmark scripts will generate `benchmarks/results_*.jsonl` and `benchmarks/results_*.json` locally. This repo includes the runners and docs; pre-generated result artifacts are not committed by default.
 
 ## Requirements
 

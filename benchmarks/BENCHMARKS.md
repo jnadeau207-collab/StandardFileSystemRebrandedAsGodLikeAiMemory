@@ -308,8 +308,8 @@ The palace classifies each question into one of 5 halls. Pass 1 searches only wi
 ### Setup
 
 ```bash
-git clone -b ben/benchmarking https://github.com/aya-thekeeper/mempal.git
-cd mempal
+# Use this repository checkout (the benchmark runners live under ./benchmarks)
+cd /path/to/StandardFileSystemRebrandedAsGodLikeAiMemory
 pip install chromadb pyyaml
 mkdir -p /tmp/longmemeval-data
 curl -fsSL -o /tmp/longmemeval-data/longmemeval_s_cleaned.json \
@@ -375,8 +375,8 @@ python benchmarks/longmemeval_bench.py \
 ### Diary + Haiku rerank (needs precomputed cache) — needs API key
 
 ```bash
-# First build the diary cache (one-time, ~$5-10 for all 19,195 sessions)
-python /tmp/build_diary_cache.py
+# Requires a separate diary-cache precompute script that is not included in this repo.
+# This benchmark command assumes that cache already exists.
 
 # Then run with cache
 python benchmarks/longmemeval_bench.py \
@@ -507,7 +507,7 @@ The LoCoMo 100% result with top-k=50 has a structural issue: each of the 10 conv
 
 **The data is public.** LongMemEval, LoCoMo, and ConvoMem are all published academic datasets. Links are in the scripts.
 
-**The results are auditable.** Every result JSONL file in `benchmarks/results_*.jsonl` contains every question, every retrieved document, every score. You can inspect every individual answer — not just the aggregate.
+**The results are auditable when generated locally.** Running the benchmark scripts writes `benchmarks/results_*.jsonl` / `benchmarks/results_*.json` files with per-question retrieval details. This repository currently ships the runners and documentation, not pre-generated results artifacts.
 
 **What "retrieval recall" means here.** These scores measure whether the correct session is in the top-K retrieved results. They do *not* measure whether an LLM can correctly answer the question using that retrieval. End-to-end QA accuracy measurement requires an LLM to generate answers, which requires an API key. The retrieval measurement itself is free.
 
@@ -517,7 +517,7 @@ The LoCoMo 100% result with top-k=50 has a structural issue: each of the 10 conv
 
 ## Results Files
 
-All raw results are committed:
+Historical result filenames referenced below are provenance records from prior runs. They are **not currently committed** in this repository by default.
 
 | File | Mode | R@5 | Notes |
 |---|---|---|---|
