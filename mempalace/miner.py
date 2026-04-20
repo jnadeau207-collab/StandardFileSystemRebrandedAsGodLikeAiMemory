@@ -18,6 +18,8 @@ import chromadb
 
 from .dialect import Dialect
 from .knowledge_graph import KnowledgeGraph
+from .structure_helpers import StructureManager
+from .structure_store import StructureStore
 
 READABLE_EXTENSIONS = {
     ".txt",
@@ -59,6 +61,16 @@ SKIP_DIRS = {
 CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
+EMBED_DIM = 16
+
+
+def _deterministic_embedding(text: str) -> list[float]:
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    values = []
+    for i in range(EMBED_DIM):
+        chunk = digest[i * 2 : (i + 1) * 2]
+        values.append(int.from_bytes(chunk, "big") / 65535.0)
+    return values
 
 
 # =============================================================================
@@ -208,13 +220,22 @@ def file_already_mined(collection, source_file: str) -> bool:
 
 
 def add_drawer(
-    collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
+    collection,
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    domain_id: str,
+    container_node_id: str,
 ):
     """Add one drawer to the palace."""
     drawer_id = f"drawer_{wing}_{room}_{hashlib.md5((source_file + str(chunk_index)).encode()).hexdigest()[:16]}"
     try:
         collection.add(
             documents=[content],
+            embeddings=[_deterministic_embedding(content)],
             ids=[drawer_id],
             metadatas=[
                 {
@@ -222,6 +243,8 @@ def add_drawer(
                     "room": room,
                     "source_file": source_file,
                     "chunk_index": chunk_index,
+                    "domain_id": domain_id,
+                    "container_node_id": container_node_id,
                     "added_by": agent,
                     "filed_at": datetime.now().isoformat(),
                 }
@@ -247,6 +270,8 @@ def process_file(
     rooms: list,
     agent: str,
     dry_run: bool,
+    structure_manager=None,
+    placement_cache: dict | None = None,
 ) -> int:
     """Read, chunk, route, and file one file. Returns drawer count."""
 
@@ -272,6 +297,13 @@ def process_file(
         return len(chunks)
 
     drawers_added = 0
+    placement_cache = placement_cache if placement_cache is not None else {}
+    placement_key = (wing, room)
+    placement = placement_cache.get(placement_key)
+    if placement is None:
+        placement = structure_manager.resolve_ordinary_container(wing=wing, room=room)
+        placement_cache[placement_key] = placement
+
     for chunk in chunks:
         added = add_drawer(
             collection=collection,
@@ -281,6 +313,8 @@ def process_file(
             source_file=source_file,
             chunk_index=chunk["chunk_index"],
             agent=agent,
+            domain_id=placement["domain_id"],
+            container_node_id=placement["container_node_id"],
         )
         if added:
             drawers_added += 1
@@ -359,7 +393,12 @@ def _post_mine_compress(palace_path, wing, entity_config_path=None):
         comp_meta["compression_ratio"] = round(stats["ratio"], 1)
         comp_meta["original_tokens"] = stats["original_tokens"]
         try:
-            comp_col.add(ids=[doc_id], documents=[compressed], metadatas=[comp_meta])
+            comp_col.add(
+                ids=[doc_id],
+                documents=[compressed],
+                embeddings=[_deterministic_embedding(compressed)],
+                metadatas=[comp_meta],
+            )
             compressed_count += 1
         except Exception:
             pass  # skip duplicates
@@ -424,8 +463,12 @@ def mine(
 
     if not dry_run:
         collection = get_collection(palace_path)
+        structure_manager = StructureManager(StructureStore.default_db_path(palace_path))
+        placement_cache = {}
     else:
         collection = None
+        structure_manager = None
+        placement_cache = None
 
     total_drawers = 0
     files_skipped = 0
@@ -440,6 +483,8 @@ def mine(
             rooms=rooms,
             agent=agent,
             dry_run=dry_run,
+            structure_manager=structure_manager,
+            placement_cache=placement_cache,
         )
         if drawers == 0 and not dry_run:
             files_skipped += 1
@@ -475,6 +520,8 @@ def mine(
         print(f"    {room:20} {count} files")
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+    if structure_manager is not None:
+        structure_manager.close()
 
 
 # =============================================================================

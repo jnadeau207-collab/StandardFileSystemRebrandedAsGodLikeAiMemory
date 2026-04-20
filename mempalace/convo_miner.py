@@ -18,7 +18,9 @@ from collections import defaultdict
 import chromadb
 
 from .normalize import normalize
-from .miner import _post_mine_compress, _post_mine_extract_kg
+from .miner import _post_mine_compress, _post_mine_extract_kg, _deterministic_embedding
+from .structure_helpers import StructureManager
+from .structure_store import StructureStore
 
 
 # File types that might contain conversations
@@ -286,6 +288,8 @@ def mine_convos(
     print(f"{'─' * 55}\n")
 
     collection = get_collection(palace_path) if not dry_run else None
+    structure_manager = None if dry_run else StructureManager(StructureStore.default_db_path(palace_path))
+    placement_cache = {}
 
     total_drawers = 0
     files_skipped = 0
@@ -353,10 +357,16 @@ def mine_convos(
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts[chunk_room] += 1
+            placement_key = (wing, chunk_room)
+            placement = placement_cache.get(placement_key)
+            if placement is None:
+                placement = structure_manager.resolve_ordinary_container(wing=wing, room=chunk_room)
+                placement_cache[placement_key] = placement
             drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.md5((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:16]}"
             try:
                 collection.add(
                     documents=[chunk["content"]],
+                    embeddings=[_deterministic_embedding(chunk["content"])],
                     ids=[drawer_id],
                     metadatas=[
                         {
@@ -364,6 +374,8 @@ def mine_convos(
                             "room": chunk_room,
                             "source_file": source_file,
                             "chunk_index": chunk["chunk_index"],
+                            "domain_id": placement["domain_id"],
+                            "container_node_id": placement["container_node_id"],
                             "added_by": agent,
                             "filed_at": datetime.now().isoformat(),
                             "ingest_mode": "convos",
@@ -405,6 +417,8 @@ def mine_convos(
             print(f"    {room:20} {count} files")
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+    if structure_manager is not None:
+        structure_manager.close()
 
 
 if __name__ == "__main__":

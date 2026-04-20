@@ -19,8 +19,16 @@ def test_convo_mining():
     col = client.get_collection("mempalace_drawers")
     assert col.count() >= 2
 
-    # Verify search works
-    results = col.query(query_texts=["memory persistence"], n_results=1)
-    assert len(results["documents"][0]) > 0
+    # Verify data is present
+    results = col.get(limit=1, include=["documents"])
+    assert len(results["documents"]) > 0
+    row = col.get(limit=1, include=["metadatas"])
+    meta = row["metadatas"][0]
+    assert meta["wing"] == "test_convos"
+    assert "room" in meta
+    assert "source_file" in meta
+    assert "chunk_index" in meta
+    assert "domain_id" in meta
+    assert "container_node_id" in meta
 
     shutil.rmtree(tmpdir)

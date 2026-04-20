@@ -10,6 +10,7 @@ from pathlib import Path
 
 DEFAULT_PALACE_PATH = os.path.expanduser("~/.mempalace/palace")
 DEFAULT_COLLECTION_NAME = "mempalace_drawers"
+DEFAULT_STRUCTURE_DB_PATH = os.path.expanduser("~/.mempalace/structure.sqlite3")
 
 DEFAULT_TOPIC_WINGS = [
     "emotions",
@@ -97,6 +98,15 @@ class MempalaceConfig:
             return env_val
         return self._file_config.get("palace_path", DEFAULT_PALACE_PATH)
 
+
+    @property
+    def structure_db_path(self):
+        """Path to SQLite structure metadata database."""
+        env_val = os.environ.get("MEMPALACE_STRUCTURE_DB_PATH")
+        if env_val:
+            return env_val
+        return self._file_config.get("structure_db_path", DEFAULT_STRUCTURE_DB_PATH)
+
     @property
     def collection_name(self):
         """ChromaDB collection name."""
@@ -130,6 +140,7 @@ class MempalaceConfig:
             default_config = {
                 "palace_path": DEFAULT_PALACE_PATH,
                 "collection_name": DEFAULT_COLLECTION_NAME,
+                "structure_db_path": DEFAULT_STRUCTURE_DB_PATH,
                 "topic_wings": DEFAULT_TOPIC_WINGS,
                 "hall_keywords": DEFAULT_HALL_KEYWORDS,
             }
