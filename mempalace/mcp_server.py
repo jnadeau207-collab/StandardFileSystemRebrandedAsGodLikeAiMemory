@@ -1,48 +1,38 @@
 #!/usr/bin/env python3
-"""
-MemPalace MCP Server — read/write palace access for Claude Code
-================================================================
-Install: claude mcp add mempalace -- python /path/to/mcp_server.py
+"""MemPalace MCP server with structure-aware tools and backward compatibility."""
 
-Tools (read):
-  mempalace_status          — total drawers, wing/room breakdown
-  mempalace_list_wings      — all wings with drawer counts
-  mempalace_list_rooms      — rooms within a wing
-  mempalace_get_taxonomy    — full wing → room → count tree
-  mempalace_search          — semantic search, optional wing/room filter
-  mempalace_check_duplicate — check if content already exists before filing
+from __future__ import annotations
 
-Tools (write):
-  mempalace_add_drawer      — file verbatim content into a wing/room
-  mempalace_delete_drawer   — remove a drawer by ID
-"""
-
-import sys
+import hashlib
 import json
 import logging
-import hashlib
+import re
+import sys
 from datetime import datetime
 
-from .config import MempalaceConfig
-from .searcher import search_memories
-from .palace_graph import traverse, find_tunnels, graph_stats
-from .closets import generate_closets, get_closet, list_closets
-from .layers import MemoryStack
-from .dialect import Dialect
 import chromadb
 
+from . import __version__
+from .closets import generate_closets, get_closet, list_closets
+from .config import MempalaceConfig
+from .dialect import Dialect
 from .knowledge_graph import KnowledgeGraph
-
-_kg = KnowledgeGraph()
+from .layers import MemoryStack
+from .miner import _deterministic_embedding
+from .palace_graph import find_tunnels, graph_stats, traverse
+from .searcher import search_memories
+from .structure_helpers import StructureManager
+from .structure_store import StructureStore
+from .tracing import absolute_lineage, local_lineage
 
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 logger = logging.getLogger("mempalace_mcp")
 
 _config = MempalaceConfig()
+_kg = KnowledgeGraph()
 
 
 def _get_collection(create=False):
-    """Return the ChromaDB collection, or None on failure."""
     try:
         client = chromadb.PersistentClient(path=_config.palace_path)
         if create:
@@ -60,66 +50,125 @@ def _no_palace():
     }
 
 
+def _structure_manager() -> StructureManager:
+    return StructureManager(_config.structure_db_path)
+
+
+def _id_error(field: str, value: str, expected_prefix: str) -> dict:
+    return {
+        "error": "invalid_id",
+        "field": field,
+        "value": value,
+        "expected_prefix": expected_prefix,
+    }
+
+
+def _validate_id(value: str, prefix: str) -> bool:
+    return bool(re.match(rf"^{prefix}[a-f0-9]+$", value or ""))
+
+
+def _lineage_payload(store: StructureStore, node_id: str) -> dict:
+    local_steps = local_lineage(store, node_id)
+    absolute_steps = absolute_lineage(store, node_id)
+
+    local = [
+        {
+            "domain_id": s.domain_id,
+            "node_id": s.node_id,
+            "label": s.label,
+            "node_type": s.node_type,
+            "flavor": s.flavor,
+            "link_type": s.link_type,
+        }
+        for s in local_steps
+    ]
+    absolute = [
+        {
+            "domain_id": s.domain_id,
+            "node_id": s.node_id,
+            "label": s.label,
+            "node_type": s.node_type,
+            "flavor": s.flavor,
+            "link_type": s.link_type,
+        }
+        for s in absolute_steps
+    ]
+
+    breadcrumb_local = " > ".join(step["label"] for step in reversed(local))
+    breadcrumb_absolute = " > ".join(step["label"] for step in reversed(absolute))
+    domain_chain = []
+    for step in reversed(absolute):
+        if step["domain_id"] not in domain_chain:
+            domain_chain.append(step["domain_id"])
+
+    crossings = [
+        {
+            "domain_id": step["domain_id"],
+            "gateway_node_id": step["node_id"],
+            "label": step["label"],
+            "flavor": step["flavor"],
+        }
+        for step in absolute
+        if step["link_type"] == "gateway_domain_transition"
+    ]
+
+    node = store.get_node(node_id)
+    return {
+        "domain_id": node.domain_id,
+        "container_node_id": node.node_id,
+        "local_lineage": local,
+        "absolute_lineage": absolute,
+        "local_breadcrumb": breadcrumb_local,
+        "absolute_breadcrumb": breadcrumb_absolute,
+        "domain_chain": domain_chain,
+        "gateway_crossings": crossings,
+    }
+
+
+def _resolve_node_candidates(store: StructureStore, label: str, domain_id: str = None, node_type: str = None, parent_node_id: str = None) -> list[dict]:
+    sql = "SELECT node_id, domain_id, node_type, label, parent_node_id, flavor FROM nodes WHERE label = ?"
+    params = [label]
+    if domain_id:
+        sql += " AND domain_id = ?"
+        params.append(domain_id)
+    if node_type:
+        sql += " AND node_type = ?"
+        params.append(node_type)
+    if parent_node_id:
+        sql += " AND parent_node_id = ?"
+        params.append(parent_node_id)
+    rows = store.conn.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
 # ==================== READ TOOLS ====================
-
-
 def tool_status():
     col = _get_collection()
     if not col:
         return _no_palace()
-    count = col.count()
-    wings = {}
-    rooms = {}
-    try:
-        all_meta = col.get(include=["metadatas"])["metadatas"]
-        for m in all_meta:
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-            rooms[r] = rooms.get(r, 0) + 1
-    except Exception:
-        pass
+    wings, rooms, structured_domains = {}, {}, set()
+    structured_count = 0
+    all_meta = col.get(include=["metadatas"]).get("metadatas", [])
+    for m in all_meta:
+        w = m.get("wing", "unknown")
+        r = m.get("room", "unknown")
+        wings[w] = wings.get(w, 0) + 1
+        rooms[r] = rooms.get(r, 0) + 1
+        if m.get("domain_id") and m.get("container_node_id"):
+            structured_count += 1
+            structured_domains.add(m["domain_id"])
     return {
-        "total_drawers": count,
+        "total_drawers": len(all_meta),
+        "structured_drawers": structured_count,
+        "unstructured_drawers": len(all_meta) - structured_count,
+        "structured_domains": sorted(structured_domains),
         "wings": wings,
         "rooms": rooms,
         "palace_path": _config.palace_path,
+        "structure_db_path": _config.structure_db_path,
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
-
-
-# ── AAAK Dialect Spec ─────────────────────────────────────────────────────────
-# Included in status response so the AI learns it on first wake-up call.
-# Also available via mempalace_get_aaak_spec tool.
-
-PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
-1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
-2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
-3. IF UNSURE about a fact (name, gender, age, relationship): say "let me check" and query the palace. Wrong is worse than slow.
-4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
-5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
-
-This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
-
-AAAK_SPEC = """AAAK is a compressed memory dialect that MemPalace uses for efficient storage.
-It is designed to be readable by both humans and LLMs without decoding.
-
-FORMAT:
-  ENTITIES: 3-letter uppercase codes. ALC=Alice, JOR=Jordan, RIL=Riley, MAX=Max, BEN=Ben.
-  EMOTIONS: *action markers* before/during text. *warm*=joy, *fierce*=determined, *raw*=vulnerable, *bloom*=tenderness.
-  STRUCTURE: Pipe-separated fields. FAM: family | PROJ: projects | ⚠: warnings/reminders.
-  DATES: ISO format (2026-03-31). COUNTS: Nx = N mentions (e.g., 570x).
-  IMPORTANCE: ★ to ★★★★★ (1-5 scale).
-  HALLS: hall_facts, hall_events, hall_discoveries, hall_preferences, hall_advice.
-  WINGS: wing_user, wing_agent, wing_team, wing_code, wing_myproject, wing_hardware, wing_ue5, wing_ai_research.
-  ROOMS: Hyphenated slugs representing named ideas (e.g., chromadb-setup, gpu-pricing).
-
-EXAMPLE:
-  FAM: ALC→♡JOR | 2D(kids): RIL(18,sports) MAX(11,chess+swimming) | BEN(contributor)
-
-Read AAAK naturally — expand codes mentally, treat *markers* as emotional context.
-When WRITING AAAK: use entity codes, mark emotions, keep structure tight."""
 
 
 def tool_list_wings():
@@ -127,13 +176,9 @@ def tool_list_wings():
     if not col:
         return _no_palace()
     wings = {}
-    try:
-        all_meta = col.get(include=["metadatas"])["metadatas"]
-        for m in all_meta:
-            w = m.get("wing", "unknown")
-            wings[w] = wings.get(w, 0) + 1
-    except Exception:
-        pass
+    for m in col.get(include=["metadatas"]).get("metadatas", []):
+        w = m.get("wing", "unknown")
+        wings[w] = wings.get(w, 0) + 1
     return {"wings": wings}
 
 
@@ -142,16 +187,12 @@ def tool_list_rooms(wing: str = None):
     if not col:
         return _no_palace()
     rooms = {}
-    try:
-        kwargs = {"include": ["metadatas"]}
-        if wing:
-            kwargs["where"] = {"wing": wing}
-        all_meta = col.get(**kwargs)["metadatas"]
-        for m in all_meta:
-            r = m.get("room", "unknown")
-            rooms[r] = rooms.get(r, 0) + 1
-    except Exception:
-        pass
+    kwargs = {"include": ["metadatas"]}
+    if wing:
+        kwargs["where"] = {"wing": wing}
+    for m in col.get(**kwargs).get("metadatas", []):
+        r = m.get("room", "unknown")
+        rooms[r] = rooms.get(r, 0) + 1
     return {"wing": wing or "all", "rooms": rooms}
 
 
@@ -160,27 +201,16 @@ def tool_get_taxonomy():
     if not col:
         return _no_palace()
     taxonomy = {}
-    try:
-        all_meta = col.get(include=["metadatas"])["metadatas"]
-        for m in all_meta:
-            w = m.get("wing", "unknown")
-            r = m.get("room", "unknown")
-            if w not in taxonomy:
-                taxonomy[w] = {}
-            taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
-    except Exception:
-        pass
+    for m in col.get(include=["metadatas"]).get("metadatas", []):
+        w = m.get("wing", "unknown")
+        r = m.get("room", "unknown")
+        taxonomy.setdefault(w, {})
+        taxonomy[w][r] = taxonomy[w].get(r, 0) + 1
     return {"taxonomy": taxonomy}
 
 
 def tool_search(query: str, limit: int = 5, wing: str = None, room: str = None):
-    return search_memories(
-        query,
-        palace_path=_config.palace_path,
-        wing=wing,
-        room=room,
-        n_results=limit,
-    )
+    return search_memories(query, palace_path=_config.palace_path, wing=wing, room=room, n_results=limit)
 
 
 def tool_check_duplicate(content: str, threshold: float = 0.9):
@@ -189,83 +219,314 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
         return _no_palace()
     try:
         results = col.query(
-            query_texts=[content],
+            query_embeddings=[_deterministic_embedding(content)],
             n_results=5,
             include=["metadatas", "documents", "distances"],
         )
-        duplicates = []
-        if results["ids"] and results["ids"][0]:
-            for i, drawer_id in enumerate(results["ids"][0]):
-                dist = results["distances"][0][i]
-                similarity = round(1 - dist, 3)
-                if similarity >= threshold:
-                    meta = results["metadatas"][0][i]
-                    doc = results["documents"][0][i]
-                    duplicates.append(
-                        {
-                            "id": drawer_id,
-                            "wing": meta.get("wing", "?"),
-                            "room": meta.get("room", "?"),
-                            "similarity": similarity,
-                            "content": doc[:200] + "..." if len(doc) > 200 else doc,
-                        }
-                    )
-        return {
-            "is_duplicate": len(duplicates) > 0,
-            "matches": duplicates,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        results = col.query(
+            query_texts=[content], n_results=5, include=["metadatas", "documents", "distances"]
+        )
+
+    duplicates = []
+    if results.get("ids") and results["ids"][0]:
+        for i, drawer_id in enumerate(results["ids"][0]):
+            similarity = round(1 - results["distances"][0][i], 3)
+            if similarity < threshold:
+                continue
+            meta = results["metadatas"][0][i]
+            duplicates.append(
+                {
+                    "id": drawer_id,
+                    "wing": meta.get("wing", "?"),
+                    "room": meta.get("room", "?"),
+                    "domain_id": meta.get("domain_id"),
+                    "container_node_id": meta.get("container_node_id"),
+                    "similarity": similarity,
+                }
+            )
+    return {"is_duplicate": len(duplicates) > 0, "matches": duplicates}
 
 
 def tool_get_aaak_spec():
-    """Return the AAAK dialect specification."""
     return {"aaak_spec": AAAK_SPEC}
 
 
 def tool_traverse_graph(start_room: str, max_hops: int = 2):
-    """Walk the palace graph from a room. Find connected ideas across wings."""
     col = _get_collection()
     if not col:
         return _no_palace()
-    return traverse(start_room, col=col, max_hops=max_hops)
+    return traverse(start_room, col=col, config=_config, max_hops=max_hops)
 
 
 def tool_find_tunnels(wing_a: str = None, wing_b: str = None):
-    """Find rooms that bridge two wings — the hallways connecting domains."""
     col = _get_collection()
     if not col:
         return _no_palace()
-    return find_tunnels(wing_a, wing_b, col=col)
+    return find_tunnels(wing_a, wing_b, col=col, config=_config)
 
 
 def tool_graph_stats():
-    """Palace graph overview: nodes, tunnels, edges, connectivity."""
     col = _get_collection()
     if not col:
         return _no_palace()
-    return graph_stats(col=col)
+    return graph_stats(col=col, config=_config)
+
+
+# ==================== STRUCTURE TOOLS ====================
+def tool_structure_trace_node(node_id: str):
+    if not _validate_id(node_id, "node_"):
+        return _id_error("node_id", node_id, "node_")
+    manager = _structure_manager()
+    try:
+        node = manager.store.get_node(node_id)
+        if node is None:
+            return {"error": "not_found", "node_id": node_id}
+        payload = _lineage_payload(manager.store, node_id)
+        payload["node_type"] = node.node_type
+        payload["label"] = node.label
+        payload["flavor"] = node.flavor
+        return payload
+    finally:
+        manager.close()
+
+
+def tool_structure_trace_drawer(drawer_id: str = None, memory_id: str = None):
+    drawer_id = drawer_id or memory_id
+    if not drawer_id:
+        return {"error": "missing_id", "message": "Provide drawer_id or memory_id"}
+
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    existing = col.get(ids=[drawer_id], include=["metadatas", "documents"])
+    if not existing.get("ids"):
+        return {"error": "not_found", "drawer_id": drawer_id}
+
+    meta = existing["metadatas"][0]
+    result = {
+        "drawer_id": drawer_id,
+        "wing": meta.get("wing"),
+        "room": meta.get("room"),
+        "domain_id": meta.get("domain_id"),
+        "container_node_id": meta.get("container_node_id"),
+    }
+
+    if meta.get("domain_id") and meta.get("container_node_id"):
+        trace = tool_structure_trace_node(meta["container_node_id"])
+        if "error" not in trace:
+            result.update(trace)
+    return result
+
+
+def tool_structure_validate():
+    manager = _structure_manager()
+    try:
+        errors = []
+        domain_rows = manager.store.conn.execute("SELECT * FROM domains").fetchall()
+        node_rows = manager.store.conn.execute("SELECT * FROM nodes").fetchall()
+
+        for d in domain_rows:
+            roots = manager.store.conn.execute(
+                "SELECT COUNT(1) as c FROM nodes WHERE domain_id = ? AND is_root = 1", (d["domain_id"],)
+            ).fetchone()["c"]
+            if roots != 1:
+                errors.append({"type": "domain_root_count", "domain_id": d["domain_id"], "count": roots})
+            if d["parent_domain_id"] and not d["entry_gateway_id"]:
+                errors.append({"type": "missing_entry_gateway", "domain_id": d["domain_id"]})
+
+        for n in node_rows:
+            if n["parent_node_id"]:
+                parent = manager.store.get_node(n["parent_node_id"])
+                if parent is None or parent.domain_id != n["domain_id"]:
+                    errors.append({"type": "invalid_parent", "node_id": n["node_id"]})
+
+        for n in node_rows:
+            try:
+                absolute_lineage(manager.store, n["node_id"])
+            except Exception as exc:
+                errors.append({"type": "trace_failure", "node_id": n["node_id"], "error": str(exc)})
+
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "domain_count": len(domain_rows),
+            "node_count": len(node_rows),
+        }
+    finally:
+        manager.close()
+
+
+def tool_structure_resolve(
+    node_id: str = None,
+    wing: str = None,
+    room: str = None,
+    domain_id: str = None,
+    label: str = None,
+    node_type: str = None,
+    parent_node_id: str = None,
+):
+    manager = _structure_manager()
+    try:
+        if node_id:
+            if not _validate_id(node_id, "node_"):
+                return _id_error("node_id", node_id, "node_")
+            node = manager.store.get_node(node_id)
+            if node is None:
+                return {"error": "not_found", "node_id": node_id}
+            return {"resolved": True, "node_id": node.node_id, "domain_id": node.domain_id, "label": node.label, "node_type": node.node_type}
+
+        if wing and room:
+            if domain_id:
+                if not _validate_id(domain_id, "dom_"):
+                    return _id_error("domain_id", domain_id, "dom_")
+                base_domain = manager.store.get_domain(domain_id)
+                if base_domain is None:
+                    return {"error": "not_found", "domain_id": domain_id}
+                base_root = manager.store.get_root_node(domain_id)
+                if base_root is None:
+                    return {"error": "invalid_structure", "message": "Domain has no root node", "domain_id": domain_id}
+            else:
+                base_domain, base_root = manager.store.ensure_main_domain()
+            wing_nodes = _resolve_node_candidates(manager.store, wing, domain_id=base_domain.domain_id, node_type="wing", parent_node_id=base_root.node_id)
+            if len(wing_nodes) == 0:
+                return {"error": "not_found", "wing": wing}
+            if len(wing_nodes) > 1:
+                return {"error": "ambiguous", "kind": "wing", "candidates": wing_nodes}
+            room_nodes = _resolve_node_candidates(manager.store, room, domain_id=base_domain.domain_id, node_type="room", parent_node_id=wing_nodes[0]["node_id"])
+            if len(room_nodes) == 0:
+                return {"error": "not_found", "room": room, "wing": wing}
+            if len(room_nodes) > 1:
+                return {"error": "ambiguous", "kind": "room", "candidates": room_nodes}
+            return {"resolved": True, "domain_id": base_domain.domain_id, "wing_node_id": wing_nodes[0]["node_id"], "container_node_id": room_nodes[0]["node_id"]}
+
+        if label:
+            candidates = _resolve_node_candidates(manager.store, label, domain_id=domain_id, node_type=node_type, parent_node_id=parent_node_id)
+            if not candidates:
+                return {"error": "not_found", "label": label}
+            if len(candidates) > 1:
+                return {"error": "ambiguous", "label": label, "candidates": candidates}
+            return {"resolved": True, **candidates[0]}
+
+        return {"error": "missing_resolution_input"}
+    finally:
+        manager.close()
+
+
+def tool_structure_list_children(domain_id: str = None, node_id: str = None):
+    manager = _structure_manager()
+    try:
+        if node_id:
+            if not _validate_id(node_id, "node_"):
+                return _id_error("node_id", node_id, "node_")
+            parent = manager.store.get_node(node_id)
+            if parent is None:
+                return {"error": "not_found", "node_id": node_id}
+            rows = manager.store.conn.execute(
+                "SELECT node_id, domain_id, node_type, label, flavor FROM nodes WHERE parent_node_id = ? ORDER BY label",
+                (node_id,),
+            ).fetchall()
+            return {"parent_node_id": node_id, "children": [dict(r) for r in rows]}
+
+        if domain_id:
+            if not _validate_id(domain_id, "dom_"):
+                return _id_error("domain_id", domain_id, "dom_")
+            root = manager.store.get_root_node(domain_id)
+            if root is None:
+                return {"error": "not_found", "domain_id": domain_id}
+            rows = manager.store.conn.execute(
+                "SELECT node_id, domain_id, node_type, label, flavor FROM nodes WHERE parent_node_id = ? ORDER BY label",
+                (root.node_id,),
+            ).fetchall()
+            return {"domain_id": domain_id, "root_node_id": root.node_id, "children": [dict(r) for r in rows]}
+
+        return {"error": "missing_scope", "message": "Provide domain_id or node_id"}
+    finally:
+        manager.close()
+
+
+def tool_structure_create_gateway_anchor(domain_id: str, parent_node_id: str, label: str, flavor: str = None):
+    if not _validate_id(domain_id, "dom_"):
+        return _id_error("domain_id", domain_id, "dom_")
+    if not _validate_id(parent_node_id, "node_"):
+        return _id_error("parent_node_id", parent_node_id, "node_")
+    manager = _structure_manager()
+    try:
+        return manager.create_gateway_anchor(domain_id=domain_id, parent_node_id=parent_node_id, label=label, flavor=flavor)
+    except Exception as exc:
+        return {"error": "creation_failed", "message": str(exc)}
+    finally:
+        manager.close()
+
+
+def tool_structure_create_subdomain(parent_domain_id: str, entry_gateway_id: str, label: str):
+    if not _validate_id(parent_domain_id, "dom_"):
+        return _id_error("parent_domain_id", parent_domain_id, "dom_")
+    if not _validate_id(entry_gateway_id, "gate_"):
+        return _id_error("entry_gateway_id", entry_gateway_id, "gate_")
+    manager = _structure_manager()
+    try:
+        return manager.create_subordinate_domain(parent_domain_id=parent_domain_id, entry_gateway_id=entry_gateway_id, label=label)
+    except Exception as exc:
+        return {"error": "creation_failed", "message": str(exc)}
+    finally:
+        manager.close()
+
+
+def tool_structure_create_nested_subdomain(
+    parent_domain_id: str,
+    parent_node_id: str,
+    gateway_label: str,
+    subdomain_label: str,
+    flavor: str = None,
+):
+    if not _validate_id(parent_domain_id, "dom_"):
+        return _id_error("parent_domain_id", parent_domain_id, "dom_")
+    if not _validate_id(parent_node_id, "node_"):
+        return _id_error("parent_node_id", parent_node_id, "node_")
+    manager = _structure_manager()
+    try:
+        return manager.create_nested_subordinate_domain(
+            parent_domain_id=parent_domain_id,
+            parent_node_id=parent_node_id,
+            gateway_label=gateway_label,
+            subdomain_label=subdomain_label,
+            flavor=flavor,
+        )
+    except Exception as exc:
+        return {"error": "creation_failed", "message": str(exc)}
+    finally:
+        manager.close()
 
 
 # ==================== WRITE TOOLS ====================
-
-
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    domain_id: str = None,
+    container_node_id: str = None,
 ):
-    """File verbatim content into a wing/room. Checks for duplicates first."""
     col = _get_collection(create=True)
     if not col:
         return _no_palace()
 
-    # Duplicate check
     dup = tool_check_duplicate(content, threshold=0.9)
     if dup.get("is_duplicate"):
-        return {
-            "success": False,
-            "reason": "duplicate",
-            "matches": dup["matches"],
-        }
+        return {"success": False, "reason": "duplicate", "matches": dup["matches"]}
+
+    placement = None
+    manager = _structure_manager()
+    try:
+        if domain_id and container_node_id:
+            placement = manager.file_drawer_to_node(domain_id=domain_id, container_node_id=container_node_id)
+        else:
+            placement = manager.resolve_ordinary_container(wing=wing, room=room)
+    finally:
+        manager.close()
 
     drawer_id = f"drawer_{wing}_{room}_{hashlib.md5((content[:100] + datetime.now().isoformat()).encode()).hexdigest()[:16]}"
 
@@ -273,261 +534,83 @@ def tool_add_drawer(
         col.add(
             ids=[drawer_id],
             documents=[content],
+            embeddings=[_deterministic_embedding(content)],
             metadatas=[
                 {
                     "wing": wing,
                     "room": room,
                     "source_file": source_file or "",
                     "chunk_index": 0,
+                    "domain_id": placement["domain_id"],
+                    "container_node_id": placement["container_node_id"],
                     "added_by": added_by,
                     "filed_at": datetime.now().isoformat(),
                 }
             ],
         )
-        logger.info(f"Filed drawer: {drawer_id} → {wing}/{room}")
-        return {"success": True, "drawer_id": drawer_id, "wing": wing, "room": room}
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "wing": wing,
+            "room": room,
+            "domain_id": placement["domain_id"],
+            "container_node_id": placement["container_node_id"],
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 def tool_delete_drawer(drawer_id: str):
-    """Delete a single drawer by ID."""
     col = _get_collection()
     if not col:
         return _no_palace()
-    existing = col.get(ids=[drawer_id])
-    if not existing["ids"]:
+    existing = col.get(ids=[drawer_id], include=["metadatas"])
+    if not existing.get("ids"):
         return {"success": False, "error": f"Drawer not found: {drawer_id}"}
+    meta = existing["metadatas"][0]
     try:
         col.delete(ids=[drawer_id])
-        logger.info(f"Deleted drawer: {drawer_id}")
-        return {"success": True, "drawer_id": drawer_id}
+        return {
+            "success": True,
+            "drawer_id": drawer_id,
+            "domain_id": meta.get("domain_id"),
+            "container_node_id": meta.get("container_node_id"),
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
 # ==================== KNOWLEDGE GRAPH ====================
-
-
 def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
-    """Query the knowledge graph for an entity's relationships."""
     results = _kg.query_entity(entity, as_of=as_of, direction=direction)
     return {"entity": entity, "as_of": as_of, "facts": results, "count": len(results)}
 
 
-def tool_kg_add(
-    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
-):
-    """Add a relationship to the knowledge graph."""
-    triple_id = _kg.add_triple(
-        subject, predicate, object, valid_from=valid_from, source_closet=source_closet
-    )
+def tool_kg_add(subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None):
+    triple_id = _kg.add_triple(subject, predicate, object, valid_from=valid_from, source_closet=source_closet)
     return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
-    """Mark a fact as no longer true (set end date)."""
     _kg.invalidate(subject, predicate, object, ended=ended)
-    return {
-        "success": True,
-        "fact": f"{subject} → {predicate} → {object}",
-        "ended": ended or "today",
-    }
+    return {"success": True, "fact": f"{subject} → {predicate} → {object}", "ended": ended or "today"}
 
 
 def tool_kg_timeline(entity: str = None):
-    """Get chronological timeline of facts, optionally for one entity."""
     results = _kg.timeline(entity)
     return {"entity": entity or "all", "timeline": results, "count": len(results)}
 
 
 def tool_kg_stats():
-    """Knowledge graph overview: entities, triples, relationship types."""
     return _kg.stats()
 
 
-# ==================== AGENT DIARY ====================
-
-
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
-    """
-    Write a diary entry for this agent. Each agent gets its own wing
-    with a diary room. Entries are timestamped and accumulate over time.
-
-    This is the agent's personal journal — observations, thoughts,
-    what it worked on, what it noticed, what it thinks matters.
-    """
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
-    room = "diary"
-    col = _get_collection(create=True)
-    if not col:
-        return _no_palace()
-
-    now = datetime.now()
-    entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}_{hashlib.md5(entry[:50].encode()).hexdigest()[:8]}"
-
-    try:
-        col.add(
-            ids=[entry_id],
-            documents=[entry],
-            metadatas=[
-                {
-                    "wing": wing,
-                    "room": room,
-                    "hall": "hall_diary",
-                    "topic": topic,
-                    "type": "diary_entry",
-                    "agent": agent_name,
-                    "filed_at": now.isoformat(),
-                    "date": now.strftime("%Y-%m-%d"),
-                }
-            ],
-        )
-        logger.info(f"Diary entry: {entry_id} → {wing}/diary/{topic}")
-        return {
-            "success": True,
-            "entry_id": entry_id,
-            "agent": agent_name,
-            "topic": topic,
-            "timestamp": now.isoformat(),
-        }
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-
-def tool_diary_read(agent_name: str, last_n: int = 10):
-    """
-    Read an agent's recent diary entries. Returns the last N entries
-    in chronological order — the agent's personal journal.
-    """
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
-    col = _get_collection()
-    if not col:
-        return _no_palace()
-
-    try:
-        results = col.get(
-            where={"$and": [{"wing": wing}, {"room": "diary"}]},
-            include=["documents", "metadatas"],
-        )
-
-        if not results["ids"]:
-            return {"agent": agent_name, "entries": [], "message": "No diary entries yet."}
-
-        # Combine and sort by timestamp
-        entries = []
-        for doc, meta in zip(results["documents"], results["metadatas"]):
-            entries.append(
-                {
-                    "date": meta.get("date", ""),
-                    "timestamp": meta.get("filed_at", ""),
-                    "topic": meta.get("topic", ""),
-                    "content": doc,
-                }
-            )
-
-        entries.sort(key=lambda x: x["timestamp"], reverse=True)
-        entries = entries[:last_n]
-
-        return {
-            "agent": agent_name,
-            "entries": entries,
-            "total": len(results["ids"]),
-            "showing": len(entries),
-        }
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ==================== WAKE-UP & RECALL ====================
-
-
-def tool_wake_up(wing: str = None):
-    """Generate the L0+L1 wake-up context for the AI."""
-    stack = MemoryStack(palace_path=_config.palace_path)
-    text = stack.wake_up(wing=wing)
-    tokens = len(text) // 4
-    return {"wake_up_text": text, "estimated_tokens": tokens}
-
-
-def tool_recall(wing: str = None, room: str = None, n_results: int = 10):
-    """On-demand L2 retrieval — load context for a specific wing/room."""
-    stack = MemoryStack(palace_path=_config.palace_path)
-    text = stack.recall(wing=wing, room=room, n_results=n_results)
-    return {"recall_text": text, "wing": wing, "room": room}
-
-
-# ==================== COMPRESSION ====================
-
-
-def tool_compress_text(text: str, wing: str = None, room: str = None):
-    """Compress any text to AAAK Dialect format on demand."""
-    dialect = Dialect()
-    metadata = {}
-    if wing:
-        metadata["wing"] = wing
-    if room:
-        metadata["room"] = room
-    compressed = dialect.compress(text, metadata=metadata)
-    stats = dialect.compression_stats(text, compressed)
-    return {
-        "compressed": compressed,
-        "original_tokens": stats["original_tokens"],
-        "compressed_tokens": stats["compressed_tokens"],
-        "ratio": round(stats["ratio"], 1),
-    }
-
-
-# ==================== CLOSETS ====================
-
-
-def tool_generate_closets(wing: str = None):
-    """Generate per-room AAAK closet summaries. Closets compress all drawers
-    in a room into one compact summary (~100-200 tokens per room)."""
-    closets = generate_closets(_config.palace_path, wing=wing)
-    return {
-        "closets_generated": len(closets),
-        "rooms": list(closets.keys()),
-    }
-
-
-def tool_get_closet(wing: str = None, room: str = None):
-    """Read a closet — the compressed summary of a room's contents."""
-    closets = get_closet(_config.palace_path, wing=wing, room=room)
-    if not closets:
-        return {"error": "No closets found. Run mempalace_generate_closets first."}
-    return {"closets": closets, "count": len(closets)}
-
-
-def tool_list_closets():
-    """List all available closets with their stats."""
-    closets = list_closets(_config.palace_path)
-    return {"closets": closets, "count": len(closets)}
-
-
-# ==================== CONTRADICTION CHECK ====================
-
-
 def tool_contradiction_check(subject: str, predicate: str, object: str):
-    """Check if a new fact contradicts existing knowledge in the graph.
-    Use this BEFORE adding facts to catch conflicts early."""
-    result = _kg.check_contradiction(subject, predicate, object)
-    return result
+    return _kg.check_contradiction(subject, predicate, object)
 
 
-def tool_kg_add_safe(
-    subject: str, predicate: str, object: str,
-    valid_from: str = None, source_closet: str = None,
-    auto_resolve: bool = True,
-):
-    """Add a fact to the knowledge graph WITH contradiction checking.
-    If auto_resolve=True (default), automatically invalidates conflicting
-    exclusive predicates (e.g. old 'uses' fact replaced by new one)."""
-    result = _kg.add_triple_with_contradiction_check(
-        subject, predicate, object,
-        valid_from=valid_from, source_closet=source_closet,
-        auto_resolve=auto_resolve,
-    )
+def tool_kg_add_safe(subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None, auto_resolve: bool = True):
+    result = _kg.add_triple_with_contradiction_check(subject, predicate, object, valid_from=valid_from, source_closet=source_closet, auto_resolve=auto_resolve)
     return {
         "success": True,
         "triple_id": result["triple_id"],
@@ -538,352 +621,143 @@ def tool_kg_add_safe(
     }
 
 
-# ==================== MCP PROTOCOL ====================
+# ==================== Diary / Layers / Closets ====================
+def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
+    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    room = "diary"
+    col = _get_collection(create=True)
+    if not col:
+        return _no_palace()
+    now = datetime.now()
+    entry_id = f"diary_{wing}_{now.strftime('%Y%m%d_%H%M%S')}_{hashlib.md5(entry[:50].encode()).hexdigest()[:8]}"
+    col.add(
+        ids=[entry_id],
+        documents=[entry],
+        embeddings=[_deterministic_embedding(entry)],
+        metadatas=[
+            {
+                "wing": wing,
+                "room": room,
+                "hall": "hall_diary",
+                "topic": topic,
+                "type": "diary_entry",
+                "agent": agent_name,
+                "filed_at": now.isoformat(),
+                "date": now.strftime("%Y-%m-%d"),
+            }
+        ],
+    )
+    return {"success": True, "entry_id": entry_id, "agent": agent_name, "topic": topic, "timestamp": now.isoformat()}
+
+
+def tool_diary_read(agent_name: str, last_n: int = 10):
+    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+    results = col.get(where={"$and": [{"wing": wing}, {"room": "diary"}]}, include=["documents", "metadatas"])
+    entries = [
+        {
+            "date": m.get("date", ""),
+            "timestamp": m.get("filed_at", ""),
+            "topic": m.get("topic", ""),
+            "content": d,
+        }
+        for d, m in zip(results.get("documents", []), results.get("metadatas", []))
+    ]
+    entries.sort(key=lambda x: x["timestamp"], reverse=True)
+    return {"agent": agent_name, "entries": entries[:last_n], "total": len(entries), "showing": min(last_n, len(entries))}
+
+
+def tool_wake_up(wing: str = None):
+    text = MemoryStack(palace_path=_config.palace_path).wake_up(wing=wing)
+    return {"wake_up_text": text, "estimated_tokens": len(text) // 4}
+
+
+def tool_recall(wing: str = None, room: str = None, n_results: int = 10):
+    text = MemoryStack(palace_path=_config.palace_path).recall(wing=wing, room=room, n_results=n_results)
+    return {"recall_text": text, "wing": wing, "room": room}
+
+
+def tool_compress_text(text: str, wing: str = None, room: str = None):
+    dialect = Dialect()
+    compressed = dialect.compress(text, metadata={"wing": wing or "", "room": room or ""})
+    stats = dialect.compression_stats(text, compressed)
+    return {
+        "compressed": compressed,
+        "original_tokens": stats["original_tokens"],
+        "compressed_tokens": stats["compressed_tokens"],
+        "ratio": round(stats["ratio"], 1),
+    }
+
+
+def tool_generate_closets(wing: str = None):
+    closets = generate_closets(_config.palace_path, wing=wing)
+    return {"closets_generated": len(closets), "rooms": list(closets.keys())}
+
+
+def tool_get_closet(wing: str = None, room: str = None):
+    closets = get_closet(_config.palace_path, wing=wing, room=room)
+    if not closets:
+        return {"error": "No closets found. Run mempalace_generate_closets first."}
+    return {"closets": closets, "count": len(closets)}
+
+
+def tool_list_closets():
+    closets = list_closets(_config.palace_path)
+    return {"closets": closets, "count": len(closets)}
+
+
+# ── static content
+PALACE_PROTOCOL = """IMPORTANT — MemPalace Memory Protocol:
+1. ON WAKE-UP: Call mempalace_status to load palace overview + AAAK spec.
+2. BEFORE RESPONDING about any person, project, or past event: call mempalace_kg_query or mempalace_search FIRST. Never guess — verify.
+3. IF UNSURE about a fact (name, gender, age, relationship): say \"let me check\" and query the palace. Wrong is worse than slow.
+4. AFTER EACH SESSION: call mempalace_diary_write to record what happened, what you learned, what matters.
+5. WHEN FACTS CHANGE: call mempalace_kg_invalidate on the old fact, mempalace_kg_add for the new one.
+
+This protocol ensures the AI KNOWS before it speaks. Storage is not memory — but storage + this protocol = memory."""
+
+AAAK_SPEC = """AAAK is a compressed memory dialect that MemPalace uses for efficient storage.
+It is designed to be readable by both humans and LLMs without decoding."""
+
 
 TOOLS = {
-    "mempalace_status": {
-        "description": "Palace overview — total drawers, wing and room counts",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_status,
-    },
-    "mempalace_list_wings": {
-        "description": "List all wings with drawer counts",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_list_wings,
-    },
-    "mempalace_list_rooms": {
-        "description": "List rooms within a wing (or all rooms if no wing given)",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {"type": "string", "description": "Wing to list rooms for (optional)"},
-            },
-        },
-        "handler": tool_list_rooms,
-    },
-    "mempalace_get_taxonomy": {
-        "description": "Full taxonomy: wing → room → drawer count",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_get_taxonomy,
-    },
-    "mempalace_get_aaak_spec": {
-        "description": "Get the AAAK dialect specification — the compressed memory format MemPalace uses. Call this if you need to read or write AAAK-compressed memories.",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_get_aaak_spec,
-    },
-    "mempalace_kg_query": {
-        "description": "Query the knowledge graph for an entity's relationships. Returns typed facts with temporal validity. E.g. 'Max' → child_of Alice, loves chess, does swimming. Filter by date with as_of to see what was true at a point in time.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "entity": {
-                    "type": "string",
-                    "description": "Entity to query (e.g. 'Max', 'MyProject', 'Alice')",
-                },
-                "as_of": {
-                    "type": "string",
-                    "description": "Date filter — only facts valid at this date (YYYY-MM-DD, optional)",
-                },
-                "direction": {
-                    "type": "string",
-                    "description": "outgoing (entity→?), incoming (?→entity), or both (default: both)",
-                },
-            },
-            "required": ["entity"],
-        },
-        "handler": tool_kg_query,
-    },
-    "mempalace_kg_add": {
-        "description": "Add a fact to the knowledge graph. Subject → predicate → object with optional time window. E.g. ('Max', 'started_school', 'Year 7', valid_from='2026-09-01').",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "subject": {"type": "string", "description": "The entity doing/being something"},
-                "predicate": {
-                    "type": "string",
-                    "description": "The relationship type (e.g. 'loves', 'works_on', 'daughter_of')",
-                },
-                "object": {"type": "string", "description": "The entity being connected to"},
-                "valid_from": {
-                    "type": "string",
-                    "description": "When this became true (YYYY-MM-DD, optional)",
-                },
-                "source_closet": {
-                    "type": "string",
-                    "description": "Closet ID where this fact appears (optional)",
-                },
-            },
-            "required": ["subject", "predicate", "object"],
-        },
-        "handler": tool_kg_add,
-    },
-    "mempalace_kg_invalidate": {
-        "description": "Mark a fact as no longer true. E.g. ankle injury resolved, job ended, moved house.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "subject": {"type": "string", "description": "Entity"},
-                "predicate": {"type": "string", "description": "Relationship"},
-                "object": {"type": "string", "description": "Connected entity"},
-                "ended": {
-                    "type": "string",
-                    "description": "When it stopped being true (YYYY-MM-DD, default: today)",
-                },
-            },
-            "required": ["subject", "predicate", "object"],
-        },
-        "handler": tool_kg_invalidate,
-    },
-    "mempalace_kg_timeline": {
-        "description": "Chronological timeline of facts. Shows the story of an entity (or everything) in order.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "entity": {
-                    "type": "string",
-                    "description": "Entity to get timeline for (optional — omit for full timeline)",
-                },
-            },
-        },
-        "handler": tool_kg_timeline,
-    },
-    "mempalace_kg_stats": {
-        "description": "Knowledge graph overview: entities, triples, current vs expired facts, relationship types.",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_kg_stats,
-    },
-    "mempalace_traverse": {
-        "description": "Walk the palace graph from a room. Shows connected ideas across wings — the tunnels. Like following a thread through the palace: start at 'chromadb-setup' in wing_code, discover it connects to wing_myproject (planning) and wing_user (feelings about it).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "start_room": {
-                    "type": "string",
-                    "description": "Room to start from (e.g. 'chromadb-setup', 'riley-school')",
-                },
-                "max_hops": {
-                    "type": "integer",
-                    "description": "How many connections to follow (default: 2)",
-                },
-            },
-            "required": ["start_room"],
-        },
-        "handler": tool_traverse_graph,
-    },
-    "mempalace_find_tunnels": {
-        "description": "Find rooms that bridge two wings — the hallways connecting different domains. E.g. what topics connect wing_code to wing_team?",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing_a": {"type": "string", "description": "First wing (optional)"},
-                "wing_b": {"type": "string", "description": "Second wing (optional)"},
-            },
-        },
-        "handler": tool_find_tunnels,
-    },
-    "mempalace_graph_stats": {
-        "description": "Palace graph overview: total rooms, tunnel connections, edges between wings.",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_graph_stats,
-    },
-    "mempalace_search": {
-        "description": "Semantic search. Returns verbatim drawer content with similarity scores.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "What to search for"},
-                "limit": {"type": "integer", "description": "Max results (default 5)"},
-                "wing": {"type": "string", "description": "Filter by wing (optional)"},
-                "room": {"type": "string", "description": "Filter by room (optional)"},
-            },
-            "required": ["query"],
-        },
-        "handler": tool_search,
-    },
-    "mempalace_check_duplicate": {
-        "description": "Check if content already exists in the palace before filing",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "content": {"type": "string", "description": "Content to check"},
-                "threshold": {
-                    "type": "number",
-                    "description": "Similarity threshold 0-1 (default 0.9)",
-                },
-            },
-            "required": ["content"],
-        },
-        "handler": tool_check_duplicate,
-    },
-    "mempalace_add_drawer": {
-        "description": "File verbatim content into the palace. Checks for duplicates first.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {"type": "string", "description": "Wing (project name)"},
-                "room": {
-                    "type": "string",
-                    "description": "Room (aspect: backend, decisions, meetings...)",
-                },
-                "content": {
-                    "type": "string",
-                    "description": "Verbatim content to store — exact words, never summarized",
-                },
-                "source_file": {"type": "string", "description": "Where this came from (optional)"},
-                "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
-            },
-            "required": ["wing", "room", "content"],
-        },
-        "handler": tool_add_drawer,
-    },
-    "mempalace_delete_drawer": {
-        "description": "Delete a drawer by ID. Irreversible.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "drawer_id": {"type": "string", "description": "ID of the drawer to delete"},
-            },
-            "required": ["drawer_id"],
-        },
-        "handler": tool_delete_drawer,
-    },
-    "mempalace_diary_write": {
-        "description": "Write to your personal agent diary in AAAK format. Your observations, thoughts, what you worked on, what matters. Each agent has their own diary with full history. Write in AAAK for compression — e.g. 'SESSION:2026-04-04|built.palace.graph+diary.tools|ALC.req:agent.diaries.in.aaak|★★★'. Use entity codes from the AAAK spec.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "agent_name": {
-                    "type": "string",
-                    "description": "Your name — each agent gets their own diary wing",
-                },
-                "entry": {
-                    "type": "string",
-                    "description": "Your diary entry in AAAK format — compressed, entity-coded, emotion-marked",
-                },
-                "topic": {
-                    "type": "string",
-                    "description": "Topic tag (optional, default: general)",
-                },
-            },
-            "required": ["agent_name", "entry"],
-        },
-        "handler": tool_diary_write,
-    },
-    "mempalace_diary_read": {
-        "description": "Read your recent diary entries (in AAAK). See what past versions of yourself recorded — your journal across sessions.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "agent_name": {
-                    "type": "string",
-                    "description": "Your name — each agent gets their own diary wing",
-                },
-                "last_n": {
-                    "type": "integer",
-                    "description": "Number of recent entries to read (default: 10)",
-                },
-            },
-            "required": ["agent_name"],
-        },
-        "handler": tool_diary_read,
-    },
-    # ── Wake-up & Recall ──────────────────────────────────────────────
-    "mempalace_wake_up": {
-        "description": "Load L0 (identity) + L1 (essential story) context. This is the first thing to call at session start — gives the AI its memory in ~600-900 tokens. Optionally filter by wing for project-specific context.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {
-                    "type": "string",
-                    "description": "Optional wing filter for project-specific wake-up",
-                },
-            },
-        },
-        "handler": tool_wake_up,
-    },
-    "mempalace_recall": {
-        "description": "On-demand L2 retrieval — load context for a specific wing or room when a topic comes up in conversation. Returns ~200-500 tokens of relevant drawers.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {"type": "string", "description": "Wing to retrieve from (optional)"},
-                "room": {"type": "string", "description": "Room to retrieve from (optional)"},
-                "n_results": {"type": "integer", "description": "Max drawers to return (default: 10)"},
-            },
-        },
-        "handler": tool_recall,
-    },
-    # ── Compression ──────────────────────────────────────────────────
-    "mempalace_compress": {
-        "description": "Compress any text to AAAK Dialect format on demand. Returns the compressed text with compression stats. Use this when you want to see how text would look in AAAK before storing it.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text to compress"},
-                "wing": {"type": "string", "description": "Wing context for header (optional)"},
-                "room": {"type": "string", "description": "Room context for header (optional)"},
-            },
-            "required": ["text"],
-        },
-        "handler": tool_compress_text,
-    },
-    # ── Closets ──────────────────────────────────────────────────────
-    "mempalace_generate_closets": {
-        "description": "Generate per-room AAAK closet summaries. A closet compresses all drawers in one room into a single compact summary (~100-200 tokens). Run after mining to create room-level overviews.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {"type": "string", "description": "Wing to generate closets for (optional — omit for all)"},
-            },
-        },
-        "handler": tool_generate_closets,
-    },
-    "mempalace_get_closet": {
-        "description": "Read a closet — the compressed AAAK summary of a room. Much faster than searching all drawers. Use closets for quick orientation, then drill into specific drawers with search if needed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "wing": {"type": "string", "description": "Wing filter (optional)"},
-                "room": {"type": "string", "description": "Room filter (optional)"},
-            },
-        },
-        "handler": tool_get_closet,
-    },
-    "mempalace_list_closets": {
-        "description": "List all available closets with stats (wing, room, drawer count, generation date).",
-        "input_schema": {"type": "object", "properties": {}},
-        "handler": tool_list_closets,
-    },
-    # ── Contradiction Detection ──────────────────────────────────────
-    "mempalace_contradiction_check": {
-        "description": "Check if a new fact contradicts existing knowledge. Use BEFORE adding facts to catch conflicts. Detects: exclusive predicates (can't 'use' two things), contradictory pairs (loves vs hates), and previously-invalidated facts being re-added.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "subject": {"type": "string", "description": "Entity doing/being something"},
-                "predicate": {"type": "string", "description": "Relationship type"},
-                "object": {"type": "string", "description": "Connected entity"},
-            },
-            "required": ["subject", "predicate", "object"],
-        },
-        "handler": tool_contradiction_check,
-    },
-    "mempalace_kg_add_safe": {
-        "description": "Add a fact to the knowledge graph WITH automatic contradiction detection and resolution. Safer than kg_add — checks for conflicts first and auto-resolves exclusive predicates (e.g. if project already 'uses' X, adding 'uses' Y will invalidate X).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "subject": {"type": "string", "description": "The entity doing/being something"},
-                "predicate": {"type": "string", "description": "The relationship type"},
-                "object": {"type": "string", "description": "The entity being connected to"},
-                "valid_from": {"type": "string", "description": "When this became true (YYYY-MM-DD, optional)"},
-                "source_closet": {"type": "string", "description": "Closet ID where this fact appears (optional)"},
-                "auto_resolve": {"type": "boolean", "description": "Auto-invalidate conflicting exclusive predicates (default: true)"},
-            },
-            "required": ["subject", "predicate", "object"],
-        },
-        "handler": tool_kg_add_safe,
-    },
+    "mempalace_status": {"description": "Palace overview", "input_schema": {"type": "object", "properties": {}}, "handler": tool_status},
+    "mempalace_list_wings": {"description": "List wings", "input_schema": {"type": "object", "properties": {}}, "handler": tool_list_wings},
+    "mempalace_list_rooms": {"description": "List rooms", "input_schema": {"type": "object", "properties": {"wing": {"type": "string"}}}, "handler": tool_list_rooms},
+    "mempalace_get_taxonomy": {"description": "Wing/room taxonomy", "input_schema": {"type": "object", "properties": {}}, "handler": tool_get_taxonomy},
+    "mempalace_search": {"description": "Semantic search", "input_schema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}, "wing": {"type": "string"}, "room": {"type": "string"}}, "required": ["query"]}, "handler": tool_search},
+    "mempalace_check_duplicate": {"description": "Check duplicate", "input_schema": {"type": "object", "properties": {"content": {"type": "string"}, "threshold": {"type": "number"}}, "required": ["content"]}, "handler": tool_check_duplicate},
+    "mempalace_traverse": {"description": "Traverse graph", "input_schema": {"type": "object", "properties": {"start_room": {"type": "string"}, "max_hops": {"type": "integer"}}, "required": ["start_room"]}, "handler": tool_traverse_graph},
+    "mempalace_find_tunnels": {"description": "Find tunnels", "input_schema": {"type": "object", "properties": {"wing_a": {"type": "string"}, "wing_b": {"type": "string"}}}, "handler": tool_find_tunnels},
+    "mempalace_graph_stats": {"description": "Graph stats", "input_schema": {"type": "object", "properties": {}}, "handler": tool_graph_stats},
+    "mempalace_add_drawer": {"description": "Add drawer", "input_schema": {"type": "object", "properties": {"wing": {"type": "string"}, "room": {"type": "string"}, "content": {"type": "string"}, "source_file": {"type": "string"}, "added_by": {"type": "string"}, "domain_id": {"type": "string"}, "container_node_id": {"type": "string"}}, "required": ["wing", "room", "content"]}, "handler": tool_add_drawer},
+    "mempalace_delete_drawer": {"description": "Delete drawer", "input_schema": {"type": "object", "properties": {"drawer_id": {"type": "string"}}, "required": ["drawer_id"]}, "handler": tool_delete_drawer},
+    "mempalace_structure_trace_node": {"description": "Trace canonical node", "input_schema": {"type": "object", "properties": {"node_id": {"type": "string"}}, "required": ["node_id"]}, "handler": tool_structure_trace_node},
+    "mempalace_structure_trace_drawer": {"description": "Trace drawer by id", "input_schema": {"type": "object", "properties": {"drawer_id": {"type": "string"}, "memory_id": {"type": "string"}}}, "handler": tool_structure_trace_drawer},
+    "mempalace_structure_validate": {"description": "Validate structure", "input_schema": {"type": "object", "properties": {}}, "handler": tool_structure_validate},
+    "mempalace_structure_resolve": {"description": "Resolve labels to canonical ids", "input_schema": {"type": "object", "properties": {"node_id": {"type": "string"}, "wing": {"type": "string"}, "room": {"type": "string"}, "domain_id": {"type": "string"}, "label": {"type": "string"}, "node_type": {"type": "string"}, "parent_node_id": {"type": "string"}}}, "handler": tool_structure_resolve},
+    "mempalace_structure_list_children": {"description": "List canonical children", "input_schema": {"type": "object", "properties": {"domain_id": {"type": "string"}, "node_id": {"type": "string"}}}, "handler": tool_structure_list_children},
+    "mempalace_structure_create_gateway_anchor": {"description": "Create gateway anchor", "input_schema": {"type": "object", "properties": {"domain_id": {"type": "string"}, "parent_node_id": {"type": "string"}, "label": {"type": "string"}, "flavor": {"type": "string"}}, "required": ["domain_id", "parent_node_id", "label"]}, "handler": tool_structure_create_gateway_anchor},
+    "mempalace_structure_create_subdomain": {"description": "Create subordinate domain", "input_schema": {"type": "object", "properties": {"parent_domain_id": {"type": "string"}, "entry_gateway_id": {"type": "string"}, "label": {"type": "string"}}, "required": ["parent_domain_id", "entry_gateway_id", "label"]}, "handler": tool_structure_create_subdomain},
+    "mempalace_structure_create_nested_subdomain": {"description": "Create nested subordinate domain", "input_schema": {"type": "object", "properties": {"parent_domain_id": {"type": "string"}, "parent_node_id": {"type": "string"}, "gateway_label": {"type": "string"}, "subdomain_label": {"type": "string"}, "flavor": {"type": "string"}}, "required": ["parent_domain_id", "parent_node_id", "gateway_label", "subdomain_label"]}, "handler": tool_structure_create_nested_subdomain},
+    "mempalace_get_aaak_spec": {"description": "AAAK spec", "input_schema": {"type": "object", "properties": {}}, "handler": tool_get_aaak_spec},
+    "mempalace_kg_query": {"description": "KG query", "input_schema": {"type": "object", "properties": {"entity": {"type": "string"}, "as_of": {"type": "string"}, "direction": {"type": "string"}}, "required": ["entity"]}, "handler": tool_kg_query},
+    "mempalace_kg_add": {"description": "KG add", "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "predicate": {"type": "string"}, "object": {"type": "string"}, "valid_from": {"type": "string"}, "source_closet": {"type": "string"}}, "required": ["subject", "predicate", "object"]}, "handler": tool_kg_add},
+    "mempalace_kg_invalidate": {"description": "KG invalidate", "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "predicate": {"type": "string"}, "object": {"type": "string"}, "ended": {"type": "string"}}, "required": ["subject", "predicate", "object"]}, "handler": tool_kg_invalidate},
+    "mempalace_kg_timeline": {"description": "KG timeline", "input_schema": {"type": "object", "properties": {"entity": {"type": "string"}}}, "handler": tool_kg_timeline},
+    "mempalace_kg_stats": {"description": "KG stats", "input_schema": {"type": "object", "properties": {}}, "handler": tool_kg_stats},
+    "mempalace_contradiction_check": {"description": "KG contradiction check", "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "predicate": {"type": "string"}, "object": {"type": "string"}}, "required": ["subject", "predicate", "object"]}, "handler": tool_contradiction_check},
+    "mempalace_kg_add_safe": {"description": "KG add safe", "input_schema": {"type": "object", "properties": {"subject": {"type": "string"}, "predicate": {"type": "string"}, "object": {"type": "string"}, "valid_from": {"type": "string"}, "source_closet": {"type": "string"}, "auto_resolve": {"type": "boolean"}}, "required": ["subject", "predicate", "object"]}, "handler": tool_kg_add_safe},
+    "mempalace_diary_write": {"description": "Write diary", "input_schema": {"type": "object", "properties": {"agent_name": {"type": "string"}, "entry": {"type": "string"}, "topic": {"type": "string"}}, "required": ["agent_name", "entry"]}, "handler": tool_diary_write},
+    "mempalace_diary_read": {"description": "Read diary", "input_schema": {"type": "object", "properties": {"agent_name": {"type": "string"}, "last_n": {"type": "integer"}}, "required": ["agent_name"]}, "handler": tool_diary_read},
+    "mempalace_wake_up": {"description": "Wake up context", "input_schema": {"type": "object", "properties": {"wing": {"type": "string"}}}, "handler": tool_wake_up},
+    "mempalace_recall": {"description": "Recall context", "input_schema": {"type": "object", "properties": {"wing": {"type": "string"}, "room": {"type": "string"}, "n_results": {"type": "integer"}}}, "handler": tool_recall},
+    "mempalace_compress": {"description": "Compress text", "input_schema": {"type": "object", "properties": {"text": {"type": "string"}, "wing": {"type": "string"}, "room": {"type": "string"}}, "required": ["text"]}, "handler": tool_compress_text},
+    "mempalace_generate_closets": {"description": "Generate closets", "input_schema": {"type": "object", "properties": {"wing": {"type": "string"}}}, "handler": tool_generate_closets},
+    "mempalace_get_closet": {"description": "Get closet", "input_schema": {"type": "object", "properties": {"wing": {"type": "string"}, "room": {"type": "string"}}}, "handler": tool_get_closet},
+    "mempalace_list_closets": {"description": "List closets", "input_schema": {"type": "object", "properties": {}}, "handler": tool_list_closets},
 }
 
 
@@ -899,12 +773,12 @@ def handle_request(request):
             "result": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "serverInfo": {"name": "mempalace", "version": "2.0.0"},
+                "serverInfo": {"name": "mempalace", "version": __version__},
             },
         }
-    elif method == "notifications/initialized":
+    if method == "notifications/initialized":
         return None
-    elif method == "tools/list":
+    if method == "tools/list":
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -915,31 +789,19 @@ def handle_request(request):
                 ]
             },
         }
-    elif method == "tools/call":
+    if method == "tools/call":
         tool_name = params.get("name")
         tool_args = params.get("arguments", {})
         if tool_name not in TOOLS:
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"},
-            }
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown tool: {tool_name}"}}
         try:
             result = TOOLS[tool_name]["handler"](**tool_args)
-            return {
-                "jsonrpc": "2.0",
-                "id": req_id,
-                "result": {"content": [{"type": "text", "text": json.dumps(result, indent=2)}]},
-            }
+            return {"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": json.dumps(result, sort_keys=True)}]}}
         except Exception as e:
             logger.error(f"Tool error in {tool_name}: {e}")
             return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32000, "message": str(e)}}
 
-    return {
-        "jsonrpc": "2.0",
-        "id": req_id,
-        "error": {"code": -32601, "message": f"Unknown method: {method}"},
-    }
+    return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32601, "message": f"Unknown method: {method}"}}
 
 
 def main():

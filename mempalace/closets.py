@@ -25,6 +25,7 @@ from datetime import datetime
 import chromadb
 
 from .dialect import Dialect
+from .miner import _deterministic_embedding
 
 
 def generate_closets(palace_path, wing=None, entity_config_path=None, dry_run=False):
@@ -117,6 +118,7 @@ def generate_closets(palace_path, wing=None, entity_config_path=None, dry_run=Fa
                 closet_col.upsert(
                     ids=[closet_id],
                     documents=[closet_text],
+                    embeddings=[_deterministic_embedding(closet_text)],
                     metadatas=[{
                         "wing": w,
                         "room": r,
