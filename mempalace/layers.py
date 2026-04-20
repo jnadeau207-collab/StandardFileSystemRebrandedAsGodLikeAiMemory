@@ -24,6 +24,7 @@ from collections import defaultdict
 import chromadb
 
 from .config import MempalaceConfig
+from .searcher import search_memories
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +287,8 @@ class Layer2:
             entry = f"  [{room_name}] {snippet}"
             if source:
                 entry += f"  ({source})"
+            if meta.get("domain_id") and meta.get("container_node_id"):
+                entry += f"  [d:{meta.get('domain_id')[-8:]} n:{meta.get('container_node_id')[-8:]}]"
             lines.append(entry)
 
         return "\n".join(lines)
@@ -308,55 +311,32 @@ class Layer3:
 
     def search(self, query: str, wing: str = None, room: str = None, n_results: int = 5) -> str:
         """Semantic search, returns compact result text."""
-        try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
-        except Exception:
-            return "No palace found."
+        result = search_memories(
+            query=query,
+            palace_path=self.palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+        )
+        if result.get("error"):
+            return result["error"]
 
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
-
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
-        try:
-            results = col.query(**kwargs)
-        except Exception as e:
-            return f"Search error: {e}"
-
-        docs = results["documents"][0]
-        metas = results["metadatas"][0]
-        dists = results["distances"][0]
-
-        if not docs:
+        hits = result.get("results", [])
+        if not hits:
             return "No results found."
 
         lines = [f'## L3 — SEARCH RESULTS for "{query}"']
-        for i, (doc, meta, dist) in enumerate(zip(docs, metas, dists), 1):
-            similarity = round(1 - dist, 3)
-            wing_name = meta.get("wing", "?")
-            room_name = meta.get("room", "?")
-            source = Path(meta.get("source_file", "")).name if meta.get("source_file") else ""
-
-            snippet = doc.strip().replace("\n", " ")
+        for i, hit in enumerate(hits, 1):
+            snippet = hit["text"].strip().replace("\n", " ")
             if len(snippet) > 300:
                 snippet = snippet[:297] + "..."
 
-            lines.append(f"  [{i}] {wing_name}/{room_name} (sim={similarity})")
+            lines.append(f"  [{i}] {hit['wing']}/{hit['room']} (sim={hit['similarity']})")
             lines.append(f"      {snippet}")
-            if source:
-                lines.append(f"      src: {source}")
+            if hit.get("source_file"):
+                lines.append(f"      src: {hit['source_file']}")
+            if hit.get("absolute_breadcrumb"):
+                lines.append(f"      path: {hit['absolute_breadcrumb']}")
 
         return "\n".join(lines)
 
@@ -364,50 +344,16 @@ class Layer3:
         self, query: str, wing: str = None, room: str = None, n_results: int = 5
     ) -> list:
         """Return raw dicts instead of formatted text."""
-        try:
-            client = chromadb.PersistentClient(path=self.palace_path)
-            col = client.get_collection("mempalace_drawers")
-        except Exception:
+        result = search_memories(
+            query=query,
+            palace_path=self.palace_path,
+            wing=wing,
+            room=room,
+            n_results=n_results,
+        )
+        if result.get("error"):
             return []
-
-        where = {}
-        if wing and room:
-            where = {"$and": [{"wing": wing}, {"room": room}]}
-        elif wing:
-            where = {"wing": wing}
-        elif room:
-            where = {"room": room}
-
-        kwargs = {
-            "query_texts": [query],
-            "n_results": n_results,
-            "include": ["documents", "metadatas", "distances"],
-        }
-        if where:
-            kwargs["where"] = where
-
-        try:
-            results = col.query(**kwargs)
-        except Exception:
-            return []
-
-        hits = []
-        for doc, meta, dist in zip(
-            results["documents"][0],
-            results["metadatas"][0],
-            results["distances"][0],
-        ):
-            hits.append(
-                {
-                    "text": doc,
-                    "wing": meta.get("wing", "unknown"),
-                    "room": meta.get("room", "unknown"),
-                    "source_file": Path(meta.get("source_file", "?")).name,
-                    "similarity": round(1 - dist, 3),
-                    "metadata": meta,
-                }
-            )
-        return hits
+        return result.get("results", [])
 
 
 # ---------------------------------------------------------------------------

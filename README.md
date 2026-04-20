@@ -83,7 +83,7 @@ After the one-time setup (install → init → mine), you don't run MemPalace co
 claude mcp add mempalace -- python -m mempalace.mcp_server
 ```
 
-Now your AI has 19 tools available through MCP. Ask it anything:
+Now your AI gets a full MCP toolset (read, write, structure tracing/validation, graph navigation, knowledge graph, and recall). Ask it anything:
 
 > *"What did we decide about auth last month?"*
 
@@ -120,6 +120,43 @@ results = search_memories("auth decisions", palace_path="~/.mempalace/palace")
 Either way — your entire memory stack runs offline. ChromaDB on your machine, Llama on your machine, AAAK for compression, zero cloud calls.
 
 ---
+
+
+### Canonical Structure Layer (Current Implementation)
+
+MemPalace still supports legacy flat metadata (`wing`, `room`) for compatibility, but it now has a canonical structure substrate:
+
+- **Domain** (`domain_id`) — a recursive palace domain (root or subordinate).
+- **Node** (`node_id`) — immutable container identity within a domain (wing/room/gateway/root/etc).
+- **Gateway anchor** (`gateway_id` + gateway anchor node) — explicit transition point from parent domain to child domain.
+- **Subordinate domain** — child domain opened by one entry gateway (`entry_gateway_id`).
+
+Important rules:
+
+- Display labels (and convenience names like `wardrobe:narnia`) are **metadata/presentation**, not identity truth.
+- Canonical identity is always opaque IDs (`domain_id`, `node_id`, `gateway_id`).
+- Repeated labels and repeated gateway flavors are legal; IDs keep them unambiguous.
+
+#### Lineage and breadcrumbs
+
+- **Local lineage**: node ancestry inside one domain.
+- **Absolute lineage**: recursive trace from a node to the root domain across gateway transitions.
+- **Breadcrumbs**: human-readable renderings of lineage (for display only).
+
+Search and MCP tracing now expose both canonical IDs and breadcrumb views, so clients can display readable paths while keeping canonical references for correctness.
+
+#### Migration and backward compatibility
+
+- Legacy drawers continue to work with flat `wing`/`room` reads.
+- `migrate_legacy_flat_drawers(...)` can attach canonical `domain_id` and `container_node_id` to existing flat records (idempotent).
+- New mining paths already attach canonical structure metadata for every newly-filed drawer.
+
+#### Read-side behavior now
+
+- **Search**: still filterable by `wing`/`room`, but when structure metadata exists, results include canonical IDs, local/absolute lineage, breadcrumbs, and gateway crossings.
+- **Graph traversal**: canonical node identity is primary in structured mode, with explicit containment/gateway/tunnel edges; legacy flat traversal remains available as fallback.
+- **Layers (L2/L3)**: remain compact but now surface structure-aware context where present.
+- **MCP**: includes structure tools for trace/resolve/validate/list-children/create-gateway/create-subdomain, while preserving legacy tools and schemas.
 
 ## The Problem
 
