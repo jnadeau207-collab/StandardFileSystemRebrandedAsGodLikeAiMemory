@@ -124,7 +124,7 @@ class OllamaProvider(LLMProvider):
         if not names & wanted:
             return (
                 False,
-                f"Model '{self.model}' not loaded in Ollama. " f"Run: ollama pull {self.model}",
+                f"Model '{self.model}' not loaded in Ollama. Run: ollama pull {self.model}",
             )
         return True, "ok"
 

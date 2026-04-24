@@ -11,6 +11,9 @@ from mempalace.llm_refine import (
     _apply_classifications,
     _build_user_prompt,
     _collect_contexts,
+    _extract_json_candidates,
+    _is_authoritative_person,
+    _is_authoritative_project,
     _parse_response,
     collect_corpus_text,
     refine_entities,
@@ -60,6 +63,16 @@ def test_collect_contexts_case_insensitive():
     lines = ["lowercase alice mention"]
     out = _collect_contexts(lines, "Alice")
     assert out == ["lowercase alice mention"]
+
+
+def test_collect_contexts_uses_token_boundaries():
+    lines = [
+        "forgot should not match",
+        "Go is a language.",
+        "go-v1 shipped.",
+    ]
+    out = _collect_contexts(lines, "Go", max_lines=5)
+    assert out == ["Go is a language.", "go-v1 shipped."]
 
 
 def test_collect_contexts_dedupes_identical_lines():
@@ -127,6 +140,30 @@ def test_parse_response_restores_canonical_casing():
 
 def test_parse_response_strips_code_fences():
     text = '```json\n{"classifications": [{"name": "X", "label": "TOPIC"}]}\n```'
+    out = _parse_response(text, ["X"])
+    assert out["X"][0] == "TOPIC"
+
+
+def test_parse_response_extracts_json_after_prose():
+    text = 'Sure, here is the JSON: {"classifications": [{"name": "X", "label": "TOPIC"}]}'
+    out = _parse_response(text, ["X"])
+    assert out["X"][0] == "TOPIC"
+
+
+def test_parse_response_extracts_fenced_json_after_prose():
+    text = 'Sure:\n```json\n{"classifications": [{"name": "X", "label": "PROJECT"}]}\n```'
+    out = _parse_response(text, ["X"])
+    assert out["X"][0] == "PROJECT"
+
+
+def test_extract_json_candidates_handles_embedded_array():
+    text = 'prefix [{"name": "Y", "label": "PERSON"}] suffix'
+    candidates = _extract_json_candidates(text)
+    assert '[{"name": "Y", "label": "PERSON"}]' in candidates
+
+
+def test_parse_response_ignores_non_json_brackets_before_payload():
+    text = 'See [note] first. JSON: {"classifications": [{"name": "X", "label": "TOPIC"}]}'
     out = _parse_response(text, ["X"])
     assert out["X"][0] == "TOPIC"
 
@@ -257,6 +294,67 @@ def test_apply_classifications_topic_goes_to_uncertain():
     assert reclass == 1
 
 
+def test_apply_classifications_can_block_llm_only_project_promotion():
+    detected = {
+        "people": [],
+        "projects": [],
+        "uncertain": [
+            {
+                "name": "Terraform",
+                "type": "uncertain",
+                "confidence": 0.4,
+                "frequency": 5,
+                "signals": ["regex"],
+            }
+        ],
+    }
+    decisions = {"Terraform": ("PROJECT", "tool")}
+    new, reclass, _ = _apply_classifications(
+        detected,
+        decisions,
+        allow_project_promotions=False,
+    )
+    assert new["projects"] == []
+    assert new["uncertain"][0]["name"] == "Terraform"
+    assert new["uncertain"][0]["type"] == "uncertain"
+    assert reclass == 0
+
+
+def test_apply_classifications_allows_project_promotion_for_prose_only_mode():
+    detected = {
+        "people": [],
+        "projects": [],
+        "uncertain": [
+            {
+                "name": "Project Aurora",
+                "type": "uncertain",
+                "confidence": 0.4,
+                "frequency": 5,
+                "signals": ["regex"],
+            }
+        ],
+    }
+    decisions = {"Project Aurora": ("PROJECT", "user effort")}
+    new, reclass, _ = _apply_classifications(detected, decisions)
+    assert new["projects"][0]["name"] == "Project Aurora"
+    assert new["projects"][0]["type"] == "project"
+    assert reclass == 1
+
+
+# ── authoritative source filters ────────────────────────────────────────
+
+
+def test_is_authoritative_person_requires_git_signal():
+    assert _is_authoritative_person({"signals": ["5 commits across 2 repos"]})
+    assert not _is_authoritative_person({"signals": ["pronoun nearby (5x)"]})
+
+
+def test_is_authoritative_project_requires_manifest_or_git_signal():
+    assert _is_authoritative_project({"signals": ["package.json, 12 of your commits"]})
+    assert _is_authoritative_project({"signals": ["57 commits (none by you)"]})
+    assert not _is_authoritative_project({"signals": ["code file reference (5x)"]})
+
+
 # ── refine_entities ─────────────────────────────────────────────────────
 
 
@@ -345,6 +443,93 @@ def test_refine_entities_skips_high_confidence_projects():
     refine_entities(detected, "", provider, show_progress=False)
     # Should not have called the LLM at all
     assert provider.call_count == 0
+
+
+def test_refine_entities_refines_high_confidence_regex_projects():
+    """High-confidence regex projects still need LLM review without source signal."""
+    detected = {
+        "people": [],
+        "projects": [
+            {
+                "name": "OpenAPI",
+                "type": "project",
+                "confidence": 0.99,
+                "frequency": 5,
+                "signals": ["code file reference (5x)"],
+            }
+        ],
+        "uncertain": [],
+    }
+    provider = FakeProvider(
+        response_text=(
+            '{"classifications": [{"name": "OpenAPI", "label": "TOPIC", "reason": "technology"}]}'
+        )
+    )
+    result = refine_entities(detected, "OpenAPI schemas", provider, show_progress=False)
+    assert provider.call_count == 1
+    assert result.reclassified == 1
+    assert result.merged["projects"] == []
+    assert result.merged["uncertain"][0]["name"] == "OpenAPI"
+
+
+def test_refine_entities_refines_regex_people_but_skips_git_people():
+    detected = {
+        "people": [
+            {
+                "name": "Igor Lins e Silva",
+                "type": "person",
+                "confidence": 0.99,
+                "frequency": 100,
+                "signals": ["100 commits across 3 repos"],
+            },
+            {
+                "name": "Tool",
+                "type": "person",
+                "confidence": 0.99,
+                "frequency": 5,
+                "signals": ["pronoun nearby (5x)"],
+            },
+        ],
+        "projects": [],
+        "uncertain": [],
+    }
+    provider = FakeProvider(
+        response_text='{"classifications": [{"name": "Tool", "label": "COMMON_WORD"}]}'
+    )
+    result = refine_entities(detected, "Tool is a common noun.", provider, show_progress=False)
+    assert provider.call_count == 1
+    names = [e["name"] for e in result.merged["people"]]
+    assert names == ["Igor Lins e Silva"]
+    assert result.dropped == 1
+
+
+def test_refine_entities_can_keep_llm_only_project_in_uncertain():
+    detected = {
+        "people": [],
+        "projects": [],
+        "uncertain": [
+            {
+                "name": "Terraform",
+                "type": "uncertain",
+                "confidence": 0.4,
+                "frequency": 9,
+                "signals": ["regex"],
+            }
+        ],
+    }
+    provider = FakeProvider(
+        response_text='{"classifications": [{"name": "Terraform", "label": "PROJECT"}]}'
+    )
+    result = refine_entities(
+        detected,
+        "Terraform config",
+        provider,
+        show_progress=False,
+        allow_project_promotions=False,
+    )
+    assert result.merged["projects"] == []
+    assert result.merged["uncertain"][0]["name"] == "Terraform"
+    assert any("LLM: project" in s for s in result.merged["uncertain"][0]["signals"])
 
 
 def test_refine_entities_empty_candidates_returns_noop():

@@ -46,6 +46,10 @@ For each candidate, pick exactly ONE label:
 - COMMON_WORD: an English word, verb, or fragment that isn't a named entity at all (e.g. "Created", "Before", "Never")
 - AMBIGUOUS: context is insufficient to decide between two of the above
 
+Frameworks, runtimes, APIs, cloud services, vendors, and third-party products
+(e.g. Angular, OpenAPI, Terraform, Bun, Google) are TOPIC unless the context
+clearly says this is the user's own named codebase, product, or active effort.
+
 Use the provided context lines to disambiguate. A capitalized word that only appears in metadata ("Created: 2026-04-24") is COMMON_WORD. A name that appears with pronouns and dialogue is PERSON.
 
 Respond with JSON only. Schema:
@@ -58,7 +62,7 @@ One entry per candidate, same order as the input."""
 class RefineResult:
     merged: dict  # updated detected dict
     reclassified: int  # entries whose type changed
-    dropped: int  # entries moved out (COMMON_WORD, or AMBIGUOUS sent to uncertain)
+    dropped: int  # entries removed from the merged result (COMMON_WORD only)
     errors: list[str]  # per-batch error messages (transport/parse failures)
     batches_completed: int
     batches_total: int
@@ -70,14 +74,14 @@ def _collect_contexts(
 ) -> list[str]:
     """Return up to `max_lines` distinct lines from the corpus that mention `name`.
 
-    Case-insensitive substring match. Lines are truncated to
+    Case-insensitive token-boundary match. Lines are truncated to
     CONTEXT_WINDOW_CHARS chars to keep token usage bounded.
     """
-    needle = name.lower()
+    needle = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)", re.IGNORECASE)
     seen: set[str] = set()
     out: list[str] = []
     for line in corpus_lines:
-        if needle not in line.lower():
+        if not needle.search(line):
             continue
         trimmed = line.strip()[:CONTEXT_WINDOW_CHARS]
         if not trimmed or trimmed in seen:
@@ -102,20 +106,64 @@ def _build_user_prompt(candidates_with_contexts: list[tuple[str, str, list[str]]
     return "\n".join(parts)
 
 
+def _extract_json_candidates(text: str) -> list[str]:
+    """Return plausible JSON payloads extracted from an LLM response."""
+    text = text.strip()
+    if not text:
+        return []
+
+    candidates: list[str] = [text]
+
+    for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)\s*```", text, re.IGNORECASE):
+        candidate = match.group(1).strip()
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for start, opener in ((i, ch) for i, ch in enumerate(text) if ch in "{["):
+        closer = "}" if opener == "{" else "]"
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+                continue
+
+            if ch == '"':
+                in_string = True
+            elif ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start : i + 1].strip()
+                    if candidate and candidate not in candidates:
+                        candidates.append(candidate)
+                    break
+
+    return candidates
+
+
 def _parse_response(text: str, expected_names: list[str]) -> dict[str, tuple[str, str]]:
     """Parse the LLM's JSON response into {name: (label, reason)}.
 
     Robust to the model occasionally wrapping JSON in text or returning
     slight schema variations. Falls back to matching by candidate name.
     """
-    # Strip any surrounding fences or prose
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```\s*$", "", text)
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+    data = None
+    for candidate in _extract_json_candidates(text):
+        try:
+            data = json.loads(candidate)
+            break
+        except json.JSONDecodeError:
+            continue
+    if data is None:
         return {}
 
     entries = data.get("classifications") if isinstance(data, dict) else data
@@ -142,7 +190,9 @@ def _parse_response(text: str, expected_names: list[str]) -> dict[str, tuple[str
 
 
 def _apply_classifications(
-    detected: dict, decisions: dict[str, tuple[str, str]]
+    detected: dict,
+    decisions: dict[str, tuple[str, str]],
+    allow_project_promotions: bool = True,
 ) -> tuple[dict, int, int]:
     """Merge LLM decisions back into the detected dict.
 
@@ -182,6 +232,12 @@ def _apply_classifications(
             continue
 
         target_bucket = label_to_bucket[label]
+        if (
+            label == "PROJECT"
+            and not allow_project_promotions
+            and not _is_authoritative_project(entry)
+        ):
+            target_bucket = "uncertain"
         updated = dict(entry)
         # Append the LLM's reason as a new signal so the user sees why it moved
         signals = list(updated.get("signals", []))
@@ -201,6 +257,19 @@ def _apply_classifications(
     return new_detected, reclassified, dropped
 
 
+def _is_authoritative_person(entry: dict) -> bool:
+    """Return True for git-author people that should not be second-guessed."""
+    signals = " ".join(entry.get("signals", [])).lower()
+    return "commit" in signals and "repo" in signals
+
+
+def _is_authoritative_project(entry: dict) -> bool:
+    """Return True for manifest/git-backed projects that are already source-backed."""
+    signals = " ".join(entry.get("signals", [])).lower()
+    manifest_markers = ("package.json", "pyproject.toml", "cargo.toml", "go.mod")
+    return any(marker in signals for marker in manifest_markers) or "commit" in signals
+
+
 def _print_progress(batch_idx: int, total: int, current_name: str) -> None:
     """Overwrite-line progress indicator."""
     width = 40
@@ -217,12 +286,13 @@ def refine_entities(
     provider: LLMProvider,
     batch_size: int = BATCH_SIZE,
     show_progress: bool = True,
+    allow_project_promotions: bool = True,
 ) -> RefineResult:
     """Reclassify detected entities using the LLM provider.
 
-    Only candidates in the ``uncertain`` and ``projects`` buckets are sent for
-    refinement — ``people`` entries from git authorship are already
-    high-confidence and don't benefit from LLM second-guessing.
+    Only regex-derived candidates are sent for refinement. Git authors and
+    manifest/git-backed projects are already source-backed and don't benefit
+    from LLM second-guessing.
 
     Ctrl-C during refinement: cancels the remaining batches, returns a
     RefineResult with ``cancelled=True`` and whatever was classified before
@@ -231,16 +301,20 @@ def refine_entities(
 
     Transport or parse failures in individual batches are recorded in
     ``errors`` and do not abort the run.
+
+    ``allow_project_promotions=False`` keeps LLM-only project guesses in the
+    uncertain bucket. This is useful when manifest/git signal already supplied
+    canonical projects and regex/LLM hits are likely tools, vendors, or topics.
     """
-    # Only refine buckets that actually benefit — keep `people` as-is
-    # (git-authored people are already authoritative).
     candidates: list[tuple[str, str]] = []
-    for bucket in ("projects", "uncertain"):
+    current_type = {"people": "person", "projects": "project", "uncertain": "uncertain"}
+    for bucket in ("people", "projects", "uncertain"):
         for e in detected.get(bucket, []):
-            # Skip already-high-confidence entries (manifest-backed projects etc.)
-            if e.get("confidence", 0) >= 0.95 and bucket == "projects":
+            if bucket == "people" and _is_authoritative_person(e):
                 continue
-            candidates.append((e["name"], bucket.rstrip("s")))  # "projects" -> "project"
+            if bucket == "projects" and _is_authoritative_project(e):
+                continue
+            candidates.append((e["name"], current_type[bucket]))
 
     corpus_lines = corpus_text.splitlines() if corpus_text else []
 
@@ -300,7 +374,11 @@ def refine_entities(
         sys.stderr.write("\n")
         sys.stderr.flush()
 
-    merged, reclassified, dropped = _apply_classifications(detected, all_decisions)
+    merged, reclassified, dropped = _apply_classifications(
+        detected,
+        all_decisions,
+        allow_project_promotions=allow_project_promotions,
+    )
 
     return RefineResult(
         merged=merged,

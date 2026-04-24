@@ -91,6 +91,14 @@ def _decode_slug_fallback(slug: str) -> str:
     return parts[-1] if parts else slug
 
 
+def _safe_mtime(path: Path) -> float:
+    """Return file mtime, defaulting old on permission or filesystem errors."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
 def _resolve_project_name(project_dir: Path) -> str:
     """Read one session's cwd to recover the original project name.
 
@@ -98,7 +106,7 @@ def _resolve_project_name(project_dir: Path) -> str:
     """
     sessions = sorted(
         (p for p in project_dir.iterdir() if p.is_file() and p.suffix == ".jsonl"),
-        key=lambda p: p.stat().st_mtime,
+        key=_safe_mtime,
         reverse=True,  # newest first — most likely to be well-formed
     )
     for session in sessions:

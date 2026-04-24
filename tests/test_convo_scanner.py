@@ -1,11 +1,13 @@
 """Tests for mempalace.convo_scanner."""
 
 import json
+from pathlib import Path
 
 from mempalace.convo_scanner import (
     _decode_slug_fallback,
     _extract_cwd_from_session,
     _resolve_project_name,
+    _safe_mtime,
     is_claude_projects_root,
     scan_claude_projects,
 )
@@ -91,6 +93,23 @@ def test_decode_slug_fallback_empty():
 
 def test_decode_slug_fallback_only_dashes():
     assert _decode_slug_fallback("---") == "---"
+
+
+# ── safe metadata helpers ───────────────────────────────────────────────
+
+
+def test_safe_mtime_returns_zero_on_stat_error(tmp_path, monkeypatch):
+    f = tmp_path / "session.jsonl"
+    f.write_text("{}\n")
+    original_stat = Path.stat
+
+    def fail_stat(self):
+        if self == f:
+            raise OSError("permission denied")
+        return original_stat(self)
+
+    monkeypatch.setattr(Path, "stat", fail_stat)
+    assert _safe_mtime(f) == 0.0
 
 
 # ── _resolve_project_name ───────────────────────────────────────────────

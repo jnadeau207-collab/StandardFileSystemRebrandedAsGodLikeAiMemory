@@ -3,6 +3,7 @@
 import json
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 from mempalace.project_scanner import (
     PersonInfo,
@@ -388,6 +389,49 @@ def test_discover_entities_prefers_real_signal_over_prose(tmp_path):
     d = discover_entities(str(tmp_path))
     proj_names = [e["name"] for e in d["projects"]]
     assert "realproj" in proj_names
+
+
+def test_discover_entities_keeps_uncertain_for_llm_when_real_signal(tmp_path):
+    """With --llm, regex-uncertain prose candidates should reach refinement."""
+    (tmp_path / "package.json").write_text(json.dumps({"name": "realproj"}))
+    _init_git_repo(tmp_path)
+    (tmp_path / "doc.md").write_text("Noise appeared. Noise repeated. Noise again.")
+
+    class FakeProvider:
+        def __init__(self):
+            self.prompts = []
+
+        def classify(self, _system, user, json_mode=True):
+            self.prompts.append(user)
+            return SimpleNamespace(
+                text='{"classifications": [{"name": "Noise", "label": "COMMON_WORD"}]}'
+            )
+
+    provider = FakeProvider()
+    d = discover_entities(str(tmp_path), llm_provider=provider, show_progress=False)
+
+    assert len(provider.prompts) == 1
+    assert "Noise" in provider.prompts[0]
+    assert "Noise" not in [e["name"] for cat in d.values() for e in cat]
+
+
+def test_discover_entities_keeps_llm_only_project_uncertain_when_real_signal(tmp_path):
+    """Repo roots should not auto-promote LLM-only tools/topics into projects."""
+    (tmp_path / "package.json").write_text(json.dumps({"name": "realproj"}))
+    _init_git_repo(tmp_path)
+    (tmp_path / "doc.md").write_text("Terraform shipped. Terraform changed. Terraform runs.")
+
+    class FakeProvider:
+        def classify(self, _system, _user, json_mode=True):
+            return SimpleNamespace(
+                text='{"classifications": [{"name": "Terraform", "label": "PROJECT"}]}'
+            )
+
+    d = discover_entities(str(tmp_path), llm_provider=FakeProvider(), show_progress=False)
+
+    assert "realproj" in [e["name"] for e in d["projects"]]
+    assert "Terraform" not in [e["name"] for e in d["projects"]]
+    assert "Terraform" in [e["name"] for e in d["uncertain"]]
 
 
 # ── _UnionFind basics ──────────────────────────────────────────────────

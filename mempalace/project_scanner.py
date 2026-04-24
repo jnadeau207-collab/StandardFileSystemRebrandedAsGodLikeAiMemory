@@ -632,18 +632,28 @@ def discover_entities(
         else {"people": [], "projects": [], "uncertain": []}
     )
 
-    # If git/manifests gave us real projects, suppress the regex "uncertain" bucket.
-    # That bucket is mostly noise (common words, CamelCase tech terms, etc.) and
-    # adding it to the review flow just makes the user do triage we can skip.
+    # Without LLM refinement, suppress regex "uncertain" noise when real
+    # manifest/git signal exists. With LLM refinement enabled, keep those
+    # candidates so the model can promote real entities or drop common words.
     has_real_signal = bool(projects) or bool(people)
-    merged = _merge_detected(real_signal, prose_detected, drop_secondary_uncertain=has_real_signal)
+    merged = _merge_detected(
+        real_signal,
+        prose_detected,
+        drop_secondary_uncertain=has_real_signal and llm_provider is None,
+    )
 
     # Optional phase 2: LLM refinement.
     if llm_provider is not None:
         from mempalace.llm_refine import collect_corpus_text, refine_entities
 
         corpus = collect_corpus_text(str(project_dir))
-        result = refine_entities(merged, corpus, llm_provider, show_progress=show_progress)
+        result = refine_entities(
+            merged,
+            corpus,
+            llm_provider,
+            show_progress=show_progress,
+            allow_project_promotions=not has_real_signal,
+        )
         if show_progress:
             status_bits = []
             if result.cancelled:
