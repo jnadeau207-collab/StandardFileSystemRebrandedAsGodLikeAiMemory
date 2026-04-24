@@ -34,11 +34,14 @@ def test_env_override():
 
 
 def test_env_path_expanduser():
+    # Tilde must be expanded to match the --palace CLI code path. We don't
+    # assert "~" is absent from the final string because Windows 8.3 short
+    # paths (e.g. C:\Users\RUNNER~1\...) legitimately contain tildes — the
+    # equality check is authoritative.
     raw = os.path.join("~", "mempalace-test")
     os.environ["MEMPALACE_PALACE_PATH"] = raw
     try:
         cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
-        # Tilde must be expanded to match the --palace CLI code path.
         assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
         assert cfg.palace_path.endswith("mempalace-test")
     finally:
@@ -61,13 +64,15 @@ def test_env_path_abspath_collapses_traversal():
 
 
 def test_env_path_legacy_alias_normalized():
-    # Legacy MEMPAL_PALACE_PATH gets the same normalization treatment.
+    # Legacy MEMPAL_PALACE_PATH gets the same normalization treatment as
+    # MEMPALACE_PALACE_PATH. We don't assert "~" is absent from the final
+    # string because Windows 8.3 short paths (e.g. C:\Users\RUNNER~1\...)
+    # legitimately contain tildes — the equality check below is authoritative.
     os.environ.pop("MEMPALACE_PALACE_PATH", None)
     raw = os.path.join("~", "legacy-alias", "..", "mempalace-test")
     os.environ["MEMPAL_PALACE_PATH"] = raw
     try:
         cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
-        assert "~" not in cfg.palace_path
         assert ".." not in cfg.palace_path
         assert cfg.palace_path == os.path.abspath(os.path.expanduser(raw))
     finally:
