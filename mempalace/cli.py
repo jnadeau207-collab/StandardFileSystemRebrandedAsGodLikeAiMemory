@@ -86,21 +86,53 @@ def cmd_init(args):
         languages = cfg.entity_languages
     languages_tuple = tuple(languages)
 
+    # Optional phase-2 LLM provider (opt-in via --llm).
+    llm_provider = None
+    if getattr(args, "llm", False):
+        from .llm_client import LLMError, get_provider
+
+        try:
+            llm_provider = get_provider(
+                name=args.llm_provider,
+                model=args.llm_model,
+                endpoint=args.llm_endpoint,
+                api_key=args.llm_api_key,
+            )
+        except LLMError as e:
+            print(f"  ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+        ok, msg = llm_provider.check_available()
+        if not ok:
+            print(
+                f"  ERROR: LLM provider '{args.llm_provider}' unavailable: {msg}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+        print(f"  LLM refinement enabled: {args.llm_provider}/{args.llm_model}")
+
     # Pass 1: discover entities — manifests + git authors first, prose detection
-    # as supplement for names mentioned only in docs/notes.
+    # as supplement for names mentioned only in docs/notes. Optional phase-2
+    # LLM refinement runs inside discover_entities when llm_provider is given.
     print(f"\n  Scanning for entities in: {args.dir}")
     if languages_tuple != ("en",):
         print(f"  Languages: {', '.join(languages_tuple)}")
-    detected = discover_entities(args.dir, languages=languages_tuple)
+    detected = discover_entities(args.dir, languages=languages_tuple, llm_provider=llm_provider)
     total = len(detected["people"]) + len(detected["projects"]) + len(detected["uncertain"])
     if total > 0:
         confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
-        # Save confirmed entities to <project>/entities.json for the miner
+        # Save confirmed entities to <project>/entities.json (per-project
+        # audit trail — user can inspect or hand-edit) AND merge into the
+        # global registry the miner reads at mine time.
         if confirmed["people"] or confirmed["projects"]:
             entities_path = Path(args.dir).expanduser().resolve() / "entities.json"
-            with open(entities_path, "w") as f:
-                json.dump(confirmed, f, indent=2)
+            with open(entities_path, "w", encoding="utf-8") as f:
+                json.dump(confirmed, f, indent=2, ensure_ascii=False)
             print(f"  Entities saved: {entities_path}")
+
+            from .miner import add_to_known_entities
+
+            registry_path = add_to_known_entities(confirmed)
+            print(f"  Registry updated: {registry_path}")
     else:
         print("  No entities detected — proceeding with directory-based rooms.")
 
@@ -548,6 +580,43 @@ def main():
             "(e.g. 'en' or 'en,pt-br'). Defaults to value from config "
             "(MEMPALACE_ENTITY_LANGUAGES env var or config.json), or 'en'. "
             "When given, the value is also persisted to config.json."
+        ),
+    )
+    p_init.add_argument(
+        "--llm",
+        action="store_true",
+        help=(
+            "Enable LLM-assisted entity refinement (opt-in, local-first). "
+            "Runs after manifest/git/regex detection, asking the configured "
+            "provider to reclassify ambiguous candidates. "
+            "Ctrl-C during refinement returns partial results."
+        ),
+    )
+    p_init.add_argument(
+        "--llm-provider",
+        default="ollama",
+        choices=["ollama", "openai-compat", "anthropic"],
+        help="LLM provider (default: ollama). Use --llm to enable.",
+    )
+    p_init.add_argument(
+        "--llm-model",
+        default="gemma4:e4b",
+        help="Model name for the chosen provider (default: gemma4:e4b for Ollama).",
+    )
+    p_init.add_argument(
+        "--llm-endpoint",
+        default=None,
+        help=(
+            "Provider endpoint URL. Default for Ollama: http://localhost:11434. "
+            "Required for openai-compat."
+        ),
+    )
+    p_init.add_argument(
+        "--llm-api-key",
+        default=None,
+        help=(
+            "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
+            "for openai-compat, defaults to $OPENAI_API_KEY."
         ),
     )
 

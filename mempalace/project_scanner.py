@@ -594,6 +594,8 @@ def discover_entities(
     prose_file_cap: int = 10,
     project_cap: int = 15,
     people_cap: int = 15,
+    llm_provider: object = None,
+    show_progress: bool = True,
 ) -> dict:
     """Top-level entity discovery: real signals first, prose detection second.
 
@@ -604,10 +606,39 @@ def discover_entities(
       1. Package manifests (package.json, pyproject.toml, Cargo.toml, go.mod)
          → canonical project names
       2. Git commit authors → real people with real commit counts
-      3. Regex entity detection on prose files → supplementary names only
+      3. Claude Code conversation dirs (~/.claude/projects/) → per-session
+         project names (pulled from each session's ``cwd`` metadata)
+      4. Regex entity detection on prose files → supplementary names only
          mentioned in docs/notes (not code)
+      5. Optional LLM refinement pass — reclassifies ambiguous candidates
+         using the caller-supplied provider
+
+    Passing ``llm_provider`` enables phase-2 refinement. The caller is
+    responsible for constructing the provider (``llm_client.get_provider``)
+    and confirming availability. Refinement is blocking-interactive:
+    progress prints to stderr; Ctrl-C returns partial results.
     """
     projects, people = scan(project_dir)
+
+    # If the target is a Claude Code conversations root, extract per-project
+    # entries from there too. Same ProjectInfo shape, so dedup logic works.
+    from mempalace.convo_scanner import is_claude_projects_root, scan_claude_projects
+
+    root_path = Path(project_dir).expanduser().resolve()
+    if is_claude_projects_root(root_path):
+        convo_projects = scan_claude_projects(root_path)
+        # Dedup by name against the git-manifest list, preferring entries with
+        # more user_commits as signal strength.
+        by_name: dict[str, ProjectInfo] = {p.name: p for p in projects}
+        for cp in convo_projects:
+            existing = by_name.get(cp.name)
+            if existing is None or cp.user_commits > existing.user_commits:
+                by_name[cp.name] = cp
+        projects = sorted(
+            by_name.values(),
+            key=lambda p: (not p.is_mine, -p.user_commits, -p.total_commits, p.name),
+        )
+
     real_signal = to_detected_dict(projects, people, project_cap=project_cap, people_cap=people_cap)
 
     # Secondary pass: prose-only extraction catches names mentioned in docs
@@ -621,11 +652,45 @@ def discover_entities(
         else {"people": [], "projects": [], "uncertain": []}
     )
 
-    # If git/manifests gave us real projects, suppress the regex "uncertain" bucket.
-    # That bucket is mostly noise (common words, CamelCase tech terms, etc.) and
-    # adding it to the review flow just makes the user do triage we can skip.
+    # Without LLM refinement, suppress regex "uncertain" noise when real
+    # manifest/git signal exists. With LLM refinement enabled, keep those
+    # candidates so the model can promote real entities or drop common words.
     has_real_signal = bool(projects) or bool(people)
-    return _merge_detected(real_signal, prose_detected, drop_secondary_uncertain=has_real_signal)
+    merged = _merge_detected(
+        real_signal,
+        prose_detected,
+        drop_secondary_uncertain=has_real_signal and llm_provider is None,
+    )
+
+    # Optional phase 2: LLM refinement.
+    if llm_provider is not None:
+        from mempalace.llm_refine import collect_corpus_text, refine_entities
+
+        corpus = collect_corpus_text(str(project_dir))
+        result = refine_entities(
+            merged,
+            corpus,
+            llm_provider,
+            show_progress=show_progress,
+            allow_project_promotions=not has_real_signal,
+        )
+        if show_progress:
+            status_bits = []
+            if result.cancelled:
+                status_bits.append("cancelled")
+            if result.reclassified:
+                status_bits.append(f"reclassified {result.reclassified}")
+            if result.dropped:
+                status_bits.append(f"dropped {result.dropped}")
+            if result.errors:
+                status_bits.append(f"{len(result.errors)} batch error(s)")
+            if status_bits:
+                import sys as _sys
+
+                print(f"  LLM refine: {', '.join(status_bits)}", file=_sys.stderr)
+        merged = result.merged
+
+    return merged
 
 
 # ==================== CLI ====================
