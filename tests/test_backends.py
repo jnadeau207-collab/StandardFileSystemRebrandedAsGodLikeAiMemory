@@ -483,9 +483,7 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
 
     # Simulate a legacy palace: create collection without num_threads
     bootstrap_client = chromadb.PersistentClient(path=str(palace_path))
-    bootstrap_client.create_collection(
-        "mempalace_drawers", metadata={"hnsw:space": "cosine"}
-    )
+    bootstrap_client.create_collection("mempalace_drawers", metadata={"hnsw:space": "cosine"})
     del bootstrap_client  # drop reference so a fresh client reopens cleanly
 
     wrapper = ChromaBackend().get_collection(
@@ -494,6 +492,4 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
         create=False,
     )
 
-    assert (
-        wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
-    )
+    assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1

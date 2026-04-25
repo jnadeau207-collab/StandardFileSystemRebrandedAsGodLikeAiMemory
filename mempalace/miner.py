@@ -1005,6 +1005,7 @@ def mine(
             dry_run=dry_run,
             respect_gitignore=respect_gitignore,
             include_ignored=include_ignored,
+            files=files,
         )
 
     try:
@@ -1018,6 +1019,7 @@ def mine(
                 dry_run=dry_run,
                 respect_gitignore=respect_gitignore,
                 include_ignored=include_ignored,
+                files=files,
             )
     except MineAlreadyRunning:
         print(
@@ -1037,6 +1039,7 @@ def _mine_impl(
     dry_run: bool = False,
     respect_gitignore: bool = True,
     include_ignored: list = None,
+    files: list = None,
 ):
     project_path = Path(project_dir).expanduser().resolve()
     config = load_config(project_dir)
