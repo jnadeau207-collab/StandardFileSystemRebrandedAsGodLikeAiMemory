@@ -303,10 +303,37 @@ def _edit_distance(s1: str, s2: str) -> int:
     return prev[-1]
 
 
+def _reconfigure_stdio_utf8_on_windows():
+    """Decode --stdin payload as UTF-8 on Windows.
+
+    Without this, Python defaults stdio to the system ANSI codepage
+    (cp1252/cp1251/cp950 depending on locale), which mojibakes
+    non-ASCII fact text before pattern parsing sees it.
+    """
+    import sys
+
+    if sys.platform != "win32":
+        return
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="strict")
+        except Exception as exc:
+            print(
+                f"WARNING: Could not reconfigure {name} to UTF-8: {exc}",
+                file=sys.stderr,
+            )
+
+
 if __name__ == "__main__":
     import argparse
     import json
     import sys
+
+    _reconfigure_stdio_utf8_on_windows()
 
     parser = argparse.ArgumentParser(
         description="Check text against known facts in the MemPalace palace.",
