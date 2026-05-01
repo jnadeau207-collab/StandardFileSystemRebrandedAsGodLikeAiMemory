@@ -16,6 +16,18 @@ from pathlib import Path
 
 SAVE_INTERVAL = 15
 STATE_DIR = Path.home() / ".mempalace" / "hook_state"
+PALACE_ROOT = Path.home() / ".mempalace"
+
+
+def _palace_root_exists() -> bool:
+    """User-removable kill-switch.
+
+    If ~/.mempalace/ does not exist, the user has explicitly cleared it.
+    All hook side effects (logging, state dir creation, mining, ingestion)
+    must respect this and short-circuit BEFORE touching disk — including
+    before logging the short-circuit itself.
+    """
+    return PALACE_ROOT.exists()
 
 
 def _mempalace_python() -> str:
@@ -142,6 +154,8 @@ _state_dir_initialized = False
 
 def _log(message: str):
     """Append to hook state log file."""
+    if not PALACE_ROOT.exists():
+        return  # User removed the palace; do not recreate by logging
     global _state_dir_initialized
     try:
         if not _state_dir_initialized:
@@ -550,6 +564,9 @@ def _wing_from_transcript_path(transcript_path: str) -> str:
 
 def hook_stop(data: dict, harness: str):
     """Stop hook: block every N messages for auto-save."""
+    if not _palace_root_exists():
+        _output({})
+        return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     stop_hook_active = parsed["stop_hook_active"]
@@ -659,6 +676,9 @@ def hook_stop(data: dict, harness: str):
 
 def hook_session_start(data: dict, harness: str):
     """Session start hook: initialize session tracking state."""
+    if not _palace_root_exists():
+        _output({})
+        return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
 
@@ -673,6 +693,9 @@ def hook_session_start(data: dict, harness: str):
 
 def hook_precompact(data: dict, harness: str):
     """Precompact hook: mine transcript synchronously, then allow compaction."""
+    if not _palace_root_exists():
+        _output({})
+        return
     parsed = _parse_harness_input(data, harness)
     session_id = parsed["session_id"]
     transcript_path = parsed["transcript_path"]

@@ -959,3 +959,79 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
     # The injected value is not "true"/"1"/"yes", so the hook should NOT pass through.
     # Save must have been attempted.
     assert mock_save.called
+
+
+# --- Absent palace root: hooks must not recreate ~/.mempalace ---
+#
+# When the user removes ~/.mempalace (e.g. `rm -rf`), that is the strongest
+# possible "do not auto-capture" signal. Hooks must short-circuit BEFORE
+# touching disk — including before the log-line that previously triggered
+# STATE_DIR.mkdir() on its own.
+
+
+import mempalace.hooks_cli as hooks_cli_mod
+
+
+def _redirect_palace_root(monkeypatch, tmp_path):
+    """Point PALACE_ROOT and STATE_DIR at a tmp location that does NOT exist."""
+    fake_root = tmp_path / "absent-mempalace"
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    return fake_root
+
+
+def test_hook_stop_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_stop(
+            {"session_id": "absent", "transcript_path": str(transcript), "stop_hook_active": False},
+            "claude-code",
+        )
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_hook_precompact_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_precompact(
+            {"session_id": "absent", "transcript_path": str(transcript)},
+            "claude-code",
+        )
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_hook_session_start_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        hook_session_start({"session_id": "absent"}, "claude-code")
+    assert json.loads(buf.getvalue() or "{}") == {}
+    assert not fake_root.exists()
+
+
+def test_log_does_not_create_palace_dir_when_absent(tmp_path, monkeypatch):
+    fake_root = _redirect_palace_root(monkeypatch, tmp_path)
+    _log("test message")
+    assert not fake_root.exists()
+
+
+def test_existing_dir_proceeds_normally(tmp_path, monkeypatch):
+    """Regression: when PALACE_ROOT exists, hooks must proceed (no short-circuit)."""
+    fake_root = tmp_path / "present-mempalace"
+    fake_root.mkdir()
+    monkeypatch.setattr(hooks_cli_mod, "PALACE_ROOT", fake_root)
+    monkeypatch.setattr(hooks_cli_mod, "STATE_DIR", fake_root / "hook_state")
+    monkeypatch.setattr(hooks_cli_mod, "_state_dir_initialized", False)
+    _log("test message")
+    # _log should have created the state dir under the existing palace root
+    assert (fake_root / "hook_state").exists()
+    assert (fake_root / "hook_state" / "hook.log").is_file()
