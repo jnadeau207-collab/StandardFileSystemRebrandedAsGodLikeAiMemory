@@ -1253,3 +1253,45 @@ class TestKGLazyCache:
         ids = {id(kg) for kg in results}
         assert len(ids) == 1, f"expected 1 unique instance, got {len(ids)}"
         assert len(mcp_server._kg_by_path) == 1
+
+    def test_tool_reconnect_drains_kg_cache(self, monkeypatch):
+        """``tool_reconnect`` must close cached KG instances and clear the dict.
+
+        Without this, an external replacement of ``knowledge_graph.sqlite3``
+        leaves the server pinned to a stale ``sqlite3.Connection``.
+        """
+        from mempalace import mcp_server
+
+        class _FakeKG:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        fake_a = _FakeKG()
+        fake_b = _FakeKG()
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {"/a": fake_a, "/b": fake_b})
+        # Bypass real ChromaDB so the test isolates KG-cache behaviour.
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+
+        mcp_server.tool_reconnect()
+
+        assert fake_a.closed is True
+        assert fake_b.closed is True
+        assert mcp_server._kg_by_path == {}
+
+    def test_tool_reconnect_swallows_kg_close_errors(self, monkeypatch):
+        """A failing ``close()`` on one cached KG must not block cache clearing."""
+        from mempalace import mcp_server
+
+        class _BoomKG:
+            def close(self):
+                raise RuntimeError("boom")
+
+        monkeypatch.setattr(mcp_server, "_kg_by_path", {"/a": _BoomKG()})
+        monkeypatch.setattr(mcp_server, "_get_collection", lambda: None)
+
+        mcp_server.tool_reconnect()
+
+        assert mcp_server._kg_by_path == {}

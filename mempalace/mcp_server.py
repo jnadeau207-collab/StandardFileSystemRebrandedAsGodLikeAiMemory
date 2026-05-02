@@ -1418,10 +1418,11 @@ def tool_memories_filed_away():
 
 
 def tool_reconnect():
-    """Force the MCP server to drop the cached ChromaDB collection and reconnect.
+    """Force the MCP server to drop cached ChromaDB + KnowledgeGraph state.
 
     Use after external scripts or CLI commands modify the palace database
-    directly, which can leave the in-memory HNSW index stale.
+    or replace ``knowledge_graph.sqlite3`` directly, which can leave the
+    in-memory HNSW index stale or pin a closed-on-disk SQLite connection.
     """
     global \
         _client_cache, \
@@ -1439,6 +1440,15 @@ def tool_reconnect():
     # still applies after the reconnect.
     _vector_disabled = False
     _vector_disabled_reason = ""
+    # Drain the per-path KnowledgeGraph cache so a replaced sqlite file is
+    # reopened on the next tool call rather than served from a stale handle.
+    with _kg_cache_lock:
+        for kg in _kg_by_path.values():
+            try:
+                kg.close()
+            except Exception:
+                pass
+        _kg_by_path.clear()
     try:
         col = _get_collection()
         if col is None:
