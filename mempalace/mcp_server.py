@@ -912,12 +912,21 @@ def tool_get_drawer(drawer_id: str):
             return {"error": f"Drawer not found: {drawer_id}"}
         meta = result["metadatas"][0]
         doc = result["documents"][0]
+        # source_file is the absolute filesystem path written by the
+        # miners. Reduce to its basename before handing it to the MCP
+        # client — same threat model as the palace_path leak fix:
+        # nested-agent / multi-server topologies treat the client as a
+        # separate trust domain. Basename preserves citation utility.
+        # Mirrors the searcher.search_memories() return shape.
+        safe_meta = dict(meta) if meta else {}
+        if safe_meta.get("source_file"):
+            safe_meta["source_file"] = Path(safe_meta["source_file"]).name
         return {
             "drawer_id": drawer_id,
             "content": doc,
-            "wing": meta.get("wing", ""),
-            "room": meta.get("room", ""),
-            "metadata": meta,
+            "wing": safe_meta.get("wing", ""),
+            "room": safe_meta.get("room", ""),
+            "metadata": safe_meta,
         }
     except Exception as e:
         return {"error": str(e)}

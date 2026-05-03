@@ -122,7 +122,7 @@ Fetch a single drawer by ID — returns full content and metadata.
 |-----------|------|----------|-------------|
 | `drawer_id` | string | **Yes** | ID of the drawer to fetch |
 
-**Returns:** `{ drawer: { id, wing, room, content, ... } }`
+**Returns:** `{ drawer_id, content, wing, room, metadata }` where `metadata.source_file`, when present, is the basename only — the absolute path written by the miners is reduced before the dict is returned to MCP clients.
 
 ---
 

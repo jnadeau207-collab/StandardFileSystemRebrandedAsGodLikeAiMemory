@@ -531,6 +531,45 @@ class TestWriteTools:
         result = tool_get_drawer("nonexistent_drawer")
         assert "error" in result
 
+    def test_get_drawer_does_not_leak_absolute_source_file_path(
+        self, monkeypatch, config, palace_path, collection, kg
+    ):
+        """tool_get_drawer must not expose the absolute filesystem path
+        that the miners write into ``source_file``. Same threat class as
+        the palace_path leak in mempalace_status: in nested-agent or
+        multi-server MCP topologies the client is a separate trust
+        domain, and the directory layout of the host has no documented
+        client-side use. Basename is enough for citation."""
+        _patch_mcp_server(monkeypatch, config, kg)
+
+        secret_dir = "/private/home/alice/secret-research/2026"
+        absolute_source = f"{secret_dir}/notes.md"
+        collection.add(
+            ids=["drawer_leak_probe"],
+            documents=["verbatim drawer body for leak probe"],
+            metadatas=[
+                {
+                    "wing": "research",
+                    "room": "notes",
+                    "source_file": absolute_source,
+                    "chunk_index": 0,
+                    "added_by": "miner",
+                    "filed_at": "2026-05-03T00:00:00",
+                }
+            ],
+        )
+
+        from mempalace.mcp_server import tool_get_drawer
+
+        result = tool_get_drawer("drawer_leak_probe")
+        assert result["drawer_id"] == "drawer_leak_probe"
+        assert result["metadata"]["source_file"] == "notes.md"
+        # Defense-in-depth: no field anywhere in the response should
+        # contain the absolute path or its parent directory.
+        serialized = json.dumps(result)
+        assert absolute_source not in serialized
+        assert secret_dir not in serialized
+
     def test_list_drawers(self, monkeypatch, config, palace_path, seeded_collection, kg):
         _patch_mcp_server(monkeypatch, config, kg)
         from mempalace.mcp_server import tool_list_drawers
