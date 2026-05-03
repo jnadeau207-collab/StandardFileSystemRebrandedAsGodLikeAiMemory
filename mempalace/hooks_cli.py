@@ -26,8 +26,13 @@ def _palace_root_exists() -> bool:
     All hook side effects (logging, state dir creation, mining, ingestion)
     must respect this and short-circuit BEFORE touching disk — including
     before logging the short-circuit itself.
+
+    Uses ``is_dir()`` rather than ``exists()`` so a stray regular file at
+    ``~/.mempalace`` (or a broken symlink) is treated as absent — otherwise
+    the kill-switch would be bypassed and ``STATE_DIR.mkdir()`` would later
+    crash on ``NotADirectoryError``.
     """
-    return PALACE_ROOT.exists()
+    return PALACE_ROOT.is_dir()
 
 
 def _mempalace_python() -> str:
@@ -154,7 +159,7 @@ _state_dir_initialized = False
 
 def _log(message: str):
     """Append to hook state log file."""
-    if not PALACE_ROOT.exists():
+    if not _palace_root_exists():
         return  # User removed the palace; do not recreate by logging
     global _state_dir_initialized
     try:
