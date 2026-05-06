@@ -326,68 +326,94 @@ def _get_client():
 
 
 def _get_collection(create=False):
-    """Return the ChromaDB collection, caching the client between calls."""
-    global _collection_cache, _metadata_cache, _metadata_cache_time
-    try:
-        client = _get_client()
-        # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
-        # collection but not the EF *instance/configuration*. So a reader or
-        # writer that omits ``embedding_function=`` silently gets chromadb's
-        # built-in ``DefaultEmbeddingFunction`` — its ``name()`` matches the
-        # one we spoof in ``mempalace.embedding`` (both report ``"default"``,
-        # the identity check passes), but the *provider list* is chromadb's
-        # default rather than the user's resolved device. On bleeding-edge
-        # interpreters (#1299: python 3.14 + chromadb 1.5.x on Apple Silicon)
-        # that default provider selection can SIGSEGV the host process on
-        # first ``col.add()``. The miner / Stop hook ingest path avoids this
-        # because it routes through ``ChromaBackend.get_collection``, which
-        # resolves the EF via ``ChromaBackend._resolve_embedding_function``;
-        # the MCP server bypassed that abstraction. Resolve the EF inside the
-        # branches that actually open a collection so warm-cache reads stay
-        # zero-cost. Reuse the backend helper so the two call sites can't
-        # drift on logging or fallback semantics.
-        if create:
-            ef = ChromaBackend._resolve_embedding_function()
-            ef_kwargs = {"embedding_function": ef} if ef is not None else {}
-            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
-            # HNSW insert path, which has a race in repairConnectionsForUpdate /
-            # addPoint (see issues #974, #965). Set via metadata on fresh
-            # collections and re-applied via _pin_hnsw_threads() for legacy
-            # palaces whose collections were created before this fix (the
-            # runtime config does not persist cross-process in chromadb 1.5.x,
-            # so the retrofit runs every time _get_collection opens a cache).
-            #
-            # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
-            # is called with metadata that differs from what's stored. The split
-            # below skips the metadata-comparison codepath for existing
-            # collections, mirroring the backend-layer fix from #1262.
-            try:
+    """Return the ChromaDB collection, caching the client between calls.
+
+    On failure, log the exception and retry once after clearing the client
+    and collection caches. Tools were silently returning ``None`` when a
+    cached client/collection went stale — typically after the chromadb
+    rust bindings invalidated a handle following an out-of-band write —
+    leaving the LLM with no diagnostic and no recovery path. The retry
+    forces ``_get_client()`` to rebuild from scratch (which re-runs
+    ``quarantine_stale_hnsw`` per #1322), so the second attempt heals the
+    common stale-handle / stale-HNSW case automatically.
+    """
+    global _client_cache, _collection_cache, _metadata_cache, _metadata_cache_time
+    for attempt in range(2):
+        try:
+            client = _get_client()
+            # ChromaDB 1.x persists the EF *identity* (its ``name()``) with the
+            # collection but not the EF *instance/configuration*. So a reader or
+            # writer that omits ``embedding_function=`` silently gets chromadb's
+            # built-in ``DefaultEmbeddingFunction`` — its ``name()`` matches the
+            # one we spoof in ``mempalace.embedding`` (both report ``"default"``,
+            # the identity check passes), but the *provider list* is chromadb's
+            # default rather than the user's resolved device. On bleeding-edge
+            # interpreters (#1299: python 3.14 + chromadb 1.5.x on Apple Silicon)
+            # that default provider selection can SIGSEGV the host process on
+            # first ``col.add()``. The miner / Stop hook ingest path avoids this
+            # because it routes through ``ChromaBackend.get_collection``, which
+            # resolves the EF via ``ChromaBackend._resolve_embedding_function``;
+            # the MCP server bypassed that abstraction. Resolve the EF inside the
+            # branches that actually open a collection so warm-cache reads stay
+            # zero-cost. Reuse the backend helper so the two call sites can't
+            # drift on logging or fallback semantics.
+            if create:
+                ef = ChromaBackend._resolve_embedding_function()
+                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+                # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
+                # HNSW insert path, which has a race in repairConnectionsForUpdate /
+                # addPoint (see issues #974, #965). Set via metadata on fresh
+                # collections and re-applied via _pin_hnsw_threads() for legacy
+                # palaces whose collections were created before this fix (the
+                # runtime config does not persist cross-process in chromadb 1.5.x,
+                # so the retrofit runs every time _get_collection opens a cache).
+                #
+                # ChromaDB 1.5.x's Rust binding SIGSEGVs when get_or_create_collection
+                # is called with metadata that differs from what's stored. The split
+                # below skips the metadata-comparison codepath for existing
+                # collections, mirroring the backend-layer fix from #1262.
+                try:
+                    raw = client.get_collection(_config.collection_name, **ef_kwargs)
+                except _ChromaNotFoundError:
+                    raw = client.create_collection(
+                        _config.collection_name,
+                        metadata={
+                            "hnsw:space": "cosine",
+                            "hnsw:num_threads": 1,
+                            **_HNSW_BLOAT_GUARD,
+                        },
+                        **ef_kwargs,
+                    )
+                _pin_hnsw_threads(raw)
+                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _metadata_cache = None
+                _metadata_cache_time = 0
+            elif _collection_cache is None:
+                ef = ChromaBackend._resolve_embedding_function()
+                ef_kwargs = {"embedding_function": ef} if ef is not None else {}
                 raw = client.get_collection(_config.collection_name, **ef_kwargs)
-            except _ChromaNotFoundError:
-                raw = client.create_collection(
-                    _config.collection_name,
-                    metadata={
-                        "hnsw:space": "cosine",
-                        "hnsw:num_threads": 1,
-                        **_HNSW_BLOAT_GUARD,
-                    },
-                    **ef_kwargs,
-                )
-            _pin_hnsw_threads(raw)
-            _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
-            _metadata_cache = None
-            _metadata_cache_time = 0
-        elif _collection_cache is None:
-            ef = ChromaBackend._resolve_embedding_function()
-            ef_kwargs = {"embedding_function": ef} if ef is not None else {}
-            raw = client.get_collection(_config.collection_name, **ef_kwargs)
-            _pin_hnsw_threads(raw)
-            _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
-            _metadata_cache = None
-            _metadata_cache_time = 0
-        return _collection_cache
-    except Exception:
-        return None
+                _pin_hnsw_threads(raw)
+                _collection_cache = ChromaCollection(raw, palace_path=_config.palace_path)
+                _metadata_cache = None
+                _metadata_cache_time = 0
+            return _collection_cache
+        except Exception:
+            logger.exception(
+                "_get_collection attempt %d/2 failed (palace=%s, create=%s)",
+                attempt + 1,
+                _config.palace_path,
+                create,
+            )
+            if attempt == 0:
+                # Reset all caches so the next attempt forces _get_client()
+                # to rebuild the chromadb client from scratch — that path
+                # re-runs quarantine_stale_hnsw (#1322) and reopens the
+                # collection cleanly, healing the common stale-handle case.
+                _client_cache = None
+                _collection_cache = None
+                _metadata_cache = None
+                _metadata_cache_time = 0
+    return None
 
 
 def _no_palace():

@@ -1259,6 +1259,71 @@ class TestCacheInvalidation:
             assert "embedding_function" in kwargs
             assert kwargs["embedding_function"] is not None
 
+    def test_get_collection_retries_once_on_exception(self, monkeypatch, config, palace_path, kg):
+        """Regression: a transient failure inside _get_collection must trigger
+        one retry after clearing the client/collection caches, not silently
+        return None.
+
+        Before this fix, a stale chromadb handle (e.g. the rust bindings
+        invalidating after an out-of-band write) would raise inside the
+        single ``try`` block, get swallowed by ``except Exception: return
+        None``, and every subsequent tool call would hit the same poisoned
+        cache returning None. The retry forces ``_get_client()`` to rebuild
+        the client (which re-runs ``quarantine_stale_hnsw`` per #1322), so
+        the second attempt heals the common stale-handle case.
+        """
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        # Force a cold cache so the first call goes through the open path.
+        mcp_server._client_cache = None
+        mcp_server._collection_cache = None
+
+        real_get_client = mcp_server._get_client
+        attempts = {"count": 0}
+
+        def flaky_get_client():
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("simulated transient chromadb failure")
+            return real_get_client()
+
+        monkeypatch.setattr(mcp_server, "_get_client", flaky_get_client)
+
+        col = mcp_server._get_collection()
+
+        # Both attempts ran and the second succeeded.
+        assert attempts["count"] == 2
+        assert col is not None
+
+    def test_get_collection_returns_none_after_two_failures(
+        self, monkeypatch, config, palace_path, kg
+    ):
+        """If both attempts fail, return None (matches the prior contract for
+        permanent failures — only the transient case is now self-healing)."""
+        _patch_mcp_server(monkeypatch, config, kg)
+        _client, _col = _get_collection(palace_path, create=True)
+        del _client
+        from mempalace import mcp_server
+
+        mcp_server._client_cache = None
+        mcp_server._collection_cache = None
+
+        attempts = {"count": 0}
+
+        def always_fails():
+            attempts["count"] += 1
+            raise RuntimeError("permanent chromadb failure")
+
+        monkeypatch.setattr(mcp_server, "_get_client", always_fails)
+
+        col = mcp_server._get_collection()
+
+        assert attempts["count"] == 2
+        assert col is None
+
 
 class TestKGLazyCache:
     """Lazy per-path KnowledgeGraph cache (issue #1136)."""
