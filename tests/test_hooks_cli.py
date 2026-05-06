@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import mempalace.hooks_cli as hooks_cli_mod
 from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
@@ -967,9 +968,6 @@ def test_stop_hook_rejects_injected_stop_hook_active(tmp_path):
 # possible "do not auto-capture" signal. Hooks must short-circuit BEFORE
 # touching disk — including before the log-line that previously triggered
 # STATE_DIR.mkdir() on its own.
-
-
-import mempalace.hooks_cli as hooks_cli_mod
 
 
 def _redirect_palace_root(monkeypatch, tmp_path):
