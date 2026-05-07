@@ -226,9 +226,11 @@ def test_rebuild_index_empty_palace(mock_backend_cls, mock_shutil, tmp_path):
 @patch("mempalace.repair.shutil")
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
-    # Create a fake sqlite file
+    # Create a valid sqlite file so the repair preflight can run quick_check.
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -247,7 +249,7 @@ def test_rebuild_index_success(mock_backend_cls, mock_shutil, tmp_path):
 
     repair.rebuild_index(palace_path=str(tmp_path))
 
-    # Verify: backed up sqlite only (not copytree)
+    # Verify: backed up sqlite only, not copytree.
     mock_shutil.copy2.assert_called_once()
     assert "chroma.sqlite3" in str(mock_shutil.copy2.call_args)
 
@@ -274,7 +276,7 @@ def test_rebuild_index_ignores_missing_temp_collection_at_start(
     mock_backend_cls, mock_shutil, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
 
     def _fake_copy2(src, dst):
         with open(dst, "w") as handle:
@@ -413,7 +415,7 @@ def test_sqlite_drawer_count_returns_none_on_unreadable_schema(tmp_path):
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_default_uses_configured_collection(mock_backend_cls, mock_shutil, tmp_path):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
     mock_col = MagicMock()
     mock_col.count.return_value = 2
     mock_col.get.return_value = {
@@ -543,7 +545,7 @@ def test_rebuild_index_stage_failure_leaves_live_collection_untouched(
     mock_backend_cls, mock_shutil, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
 
     mock_col = MagicMock()
     mock_col.count.return_value = 2
@@ -572,7 +574,7 @@ def test_rebuild_index_stage_failure_leaves_live_collection_untouched(
 @patch("mempalace.repair.ChromaBackend")
 def test_rebuild_index_live_failure_restores_backup(mock_backend_cls, mock_shutil, tmp_path):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
 
     def _fake_copy2(src, dst):
         with open(dst, "w") as handle:
@@ -618,7 +620,7 @@ def test_rebuild_index_live_delete_missing_still_restores_backup(
     mock_backend_cls, mock_shutil, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
 
     def _fake_copy2(src, dst):
         with open(dst, "w") as handle:
@@ -663,7 +665,7 @@ def test_rebuild_index_restore_failure_preserves_original_error(
     mock_backend_cls, mock_shutil, tmp_path, capsys
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
 
     def _copy2_side_effect(src, dst):
         if str(src).endswith(".backup"):
@@ -738,7 +740,7 @@ def test_rebuild_index_ignores_temp_cleanup_failure_after_success(
     mock_backend_cls, mock_shutil, tmp_path
 ):
     sqlite_path = tmp_path / "chroma.sqlite3"
-    sqlite_path.write_text("fake")
+    sqlite3.connect(str(sqlite_path)).close()
 
     def _fake_copy2(src, dst):
         with open(dst, "w") as handle:
@@ -1079,6 +1081,76 @@ def test_max_seq_id_rollback_on_verification_failure(tmp_path, monkeypatch):
     # A backup file is still present — caller can roll back from it.
     leftover = [fn for fn in os.listdir(palace) if "max-seq-id-backup-" in fn]
     assert leftover
+
+
+def test_sqlite_integrity_errors_returns_empty_for_healthy_db(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    assert repair.sqlite_integrity_errors(str(palace)) == []
+
+
+def test_sqlite_integrity_errors_reports_unreadable_sqlite_file(tmp_path):
+    palace = tmp_path / "palace"
+    palace.mkdir()
+    db_path = palace / "chroma.sqlite3"
+    db_path.write_bytes(b"not a sqlite database")
+
+    errors = repair.sqlite_integrity_errors(str(palace))
+
+    assert errors
+    assert "quick_check failed" in errors[0]
+
+
+@patch("mempalace.repair.shutil")
+@patch("mempalace.repair.ChromaBackend")
+def test_rebuild_index_aborts_on_sqlite_integrity_errors_before_delete_collection(
+    mock_backend_cls,
+    mock_shutil,
+    tmp_path,
+    capsys,
+):
+    """Regression for #1362: fail before Chroma delete_collection on sqlite corruption."""
+
+    sqlite_path = tmp_path / "chroma.sqlite3"
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute("CREATE TABLE dummy(id INTEGER PRIMARY KEY)")
+        conn.commit()
+
+    mock_col = MagicMock()
+    mock_col.count.return_value = 2
+    mock_col.get.return_value = {
+        "ids": ["id1", "id2"],
+        "documents": ["doc1", "doc2"],
+        "metadatas": [{"wing": "a"}, {"wing": "b"}],
+    }
+
+    mock_backend = _install_mock_backend(mock_backend_cls, mock_col)
+
+    with patch(
+        "mempalace.repair.sqlite_integrity_errors",
+        return_value=[
+            "Page 4 of B-tree 12345: database disk image is malformed",
+            "Page 8 of B-tree 67890: database disk image is malformed",
+        ],
+    ):
+        repair.rebuild_index(palace_path=str(tmp_path))
+
+    out = capsys.readouterr().out
+
+    assert "SQLite-layer corruption detected before repair rebuild" in out
+    assert "PRAGMA quick_check" in out
+    assert "delete_collection" in out
+    assert "Page 4 of B-tree" in out
+
+    mock_backend.delete_collection.assert_not_called()
+    mock_backend.create_collection.assert_not_called()
+    mock_shutil.copy2.assert_not_called()
 
 
 def test_max_seq_id_preflight_preserves_embeddings_queue(tmp_path):
