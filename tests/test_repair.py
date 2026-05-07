@@ -696,20 +696,24 @@ def test_max_seq_id_rollback_on_verification_failure(tmp_path, monkeypatch):
 def _seed_palace(palace_path, collection_name, rows):
     """Build a real chromadb palace at ``palace_path`` and add ``rows``.
 
-    ``rows`` is a list of ``(id, document, metadata)`` tuples. Returns
-    the populated collection so callers can assert on the writer's view
-    of state before the SQLite read.
+    ``rows`` is a list of ``(id, document, metadata)`` tuples.
     """
     from mempalace.backends.chroma import ChromaBackend
 
     backend = ChromaBackend()
-    col = backend.create_collection(str(palace_path), collection_name)
-    col.upsert(
-        ids=[r[0] for r in rows],
-        documents=[r[1] for r in rows],
-        metadatas=[r[2] for r in rows],
-    )
-    return col
+    try:
+        col = backend.create_collection(str(palace_path), collection_name)
+        col.upsert(
+            ids=[r[0] for r in rows],
+            documents=[r[1] for r in rows],
+            metadatas=[r[2] for r in rows],
+        )
+    finally:
+        # Release chromadb's rust-side SQLite/HNSW file locks before the
+        # caller proceeds. Without this, an in-place rebuild on Windows
+        # fails with WinError 32 on data_level0.bin during the archive
+        # rename (cf. PR #1310 test-windows job).
+        backend.close()
 
 
 def test_extract_via_sqlite_returns_all_rows_with_metadata(tmp_path):
