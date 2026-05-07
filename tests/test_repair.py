@@ -1186,11 +1186,31 @@ def test_rebuild_index_runs_sqlite_preflight_before_chromadb_open(tmp_path, caps
 
     sqlite_path = palace / "chroma.sqlite3"
     pre_size = sqlite_path.stat().st_size
-    assert pre_size > 16384, "need a multi-page sqlite db to mangle"
+
+    # Compute a page-aligned corruption offset that's always inside the
+    # existing file. SQLite uses 4 KB pages by default; we mangle 4 pages
+    # somewhere in the middle, skipping at least the first 2 pages
+    # (header + root) so the file still opens. Without clamping to the
+    # actual file size, a seek past EOF on r+b mode would silently
+    # extend the file with zero-padding and leave the original pages
+    # intact — quick_check would still pass, and the regression guard
+    # would skip the bug.
+    PAGE = 4096
+    CORRUPT_BYTES = 16384  # 4 pages
+    HEADER_GUARD = PAGE * 2  # leave header + root pages intact
+    assert (
+        pre_size >= HEADER_GUARD + CORRUPT_BYTES
+    ), f"sqlite db too small to mangle without truncating: {pre_size} bytes"
+    # Round (pre_size - CORRUPT_BYTES) down to a page boundary so we
+    # mangle whole pages. Cap at offset 40960 (page 10) for stable
+    # diagnostics across SQLite versions that may grow the file.
+    max_offset = (pre_size - CORRUPT_BYTES) & ~(PAGE - 1)
+    corrupt_offset = min(40960, max_offset)
+    assert corrupt_offset >= HEADER_GUARD, f"corruption offset {corrupt_offset} too close to header"
 
     with open(sqlite_path, "r+b") as f:
-        f.seek(40960)  # page 10
-        f.write(b"\xde\xad\xbe\xef" * 4096)  # 16 KB of garbage
+        f.seek(corrupt_offset)
+        f.write(b"\xde\xad\xbe\xef" * (CORRUPT_BYTES // 4))
 
     # No chromadb mocks: rebuild_index must reach sqlite_integrity_errors
     # before any code path that opens a chromadb client. If the preflight
